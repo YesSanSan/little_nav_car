@@ -44,6 +44,7 @@ def generate_launch_description():
     map_yaml_file = LaunchConfiguration('map')
     use_sim_time = LaunchConfiguration('use_sim_time')
     params_file = LaunchConfiguration('params_file')
+    self_filter_params_file = LaunchConfiguration('self_filter_params_file')
     autostart = LaunchConfiguration('autostart')
     use_composition = LaunchConfiguration('use_composition')
     use_respawn = LaunchConfiguration('use_respawn')
@@ -117,6 +118,12 @@ def generate_launch_description():
         description='Full path to the ROS2 parameters file to use for all launched nodes',
     )
 
+    declare_self_filter_params_file_cmd = DeclareLaunchArgument(
+        'self_filter_params_file',
+        default_value=os.path.join(bringup_dir, 'params', 'scan_self_filter.yaml'),
+        description='Full path to the scan self filter parameters file',
+    )
+
     declare_autostart_cmd = DeclareLaunchArgument(
         'autostart',
         default_value='true',
@@ -162,6 +169,13 @@ def generate_launch_description():
                 name='rviz2',
                 arguments=['-d', rviz_dir],
                 output='screen',
+            ),
+            Node(
+                package='lc_navigation',
+                executable='scan_self_filter.py',
+                name='scan_self_filter',
+                output='screen',
+                parameters=[self_filter_params_file],
             ),
             # Node(
             #     package="fake_localization_ros2",
@@ -237,6 +251,7 @@ def generate_launch_description():
     ld.add_action(declare_map_yaml_cmd)
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_params_file_cmd)
+    ld.add_action(declare_self_filter_params_file_cmd)
     ld.add_action(declare_autostart_cmd)
     ld.add_action(declare_use_composition_cmd)
     ld.add_action(declare_use_respawn_cmd)
