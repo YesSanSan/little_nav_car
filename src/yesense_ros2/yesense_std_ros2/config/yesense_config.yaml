@@ -1,0 +1,8 @@
+yesense_pub:
+    ros__parameters:
+        serial_port: "/dev/tty_imu"
+        baud_rate: 460800
+        frame_id: "imu_link"
+        driver_type: "ros_serial"
+        imu_topic_ros: "base/imu0"
+        imu_topic: "imu_yesense_data"

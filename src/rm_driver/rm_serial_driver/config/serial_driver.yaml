@@ -1,0 +1,3 @@
+/rm_serial_driver:
+  ros__parameters:
+    device_name: /dev/tty_base
