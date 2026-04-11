@@ -50,6 +50,7 @@ def generate_launch_description():
     use_respawn = LaunchConfiguration('use_respawn')
     log_level = LaunchConfiguration('log_level')
     use_localization = LaunchConfiguration('use_localization')
+    use_lc_vision = LaunchConfiguration('use_lc_vision')
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
     # In case of the transforms (tf), currently, there doesn't seem to be a better alternative
@@ -104,6 +105,12 @@ def generate_launch_description():
     declare_use_localization_cmd = DeclareLaunchArgument(
         'use_localization', default_value='True',
         description='Whether to enable localization or not'
+    )
+
+    declare_use_lc_vision_cmd = DeclareLaunchArgument(
+        'use_lc_vision',
+        default_value='False',
+        description='Whether to launch the lc_vision node.',
     )
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
@@ -176,6 +183,16 @@ def generate_launch_description():
                 name='scan_self_filter',
                 output='screen',
                 parameters=[self_filter_params_file],
+            ),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(
+                        get_package_share_directory('lc_vision'),
+                        'launch',
+                        'lc_vision.launch.py',
+                    )
+                ),
+                condition=IfCondition(use_lc_vision),
             ),
             # Node(
             #     package="fake_localization_ros2",
@@ -257,6 +274,7 @@ def generate_launch_description():
     ld.add_action(declare_use_respawn_cmd)
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_use_localization_cmd)
+    ld.add_action(declare_use_lc_vision_cmd)
 
     # Add the actions to launch all of the navigation nodes
     ld.add_action(bringup_cmd_group)

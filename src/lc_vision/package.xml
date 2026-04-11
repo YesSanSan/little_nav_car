@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<?xml-model
+   href="http://download.ros.org/schema/package_format3.xsd"
+   schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>lc_vision</name>
+  <version>0.1.0</version>
+  <description>Astra camera capture and Foxglove video streaming node.</description>
+  <maintainer email="nvidia@todo.todo">nvidia</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_auto</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_action</depend>
+  <depend>rclcpp_components</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>foxglove_msgs</depend>
+
+  <build_depend>pkg-config</build_depend>
+  <build_depend>libavcodec-dev</build_depend>
+  <build_depend>libavformat-dev</build_depend>
+  <build_depend>libavutil-dev</build_depend>
+  <build_depend>libswscale-dev</build_depend>
+  <build_depend>libopencv-dev</build_depend>
+
+  <exec_depend>foxglove_bridge</exec_depend>
+  <exec_depend>libavcodec60</exec_depend>
+  <exec_depend>libavformat60</exec_depend>
+  <exec_depend>libavutil58</exec_depend>
+  <exec_depend>libswscale7</exec_depend>
+  <exec_depend>libopencv-dev</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_clang_format</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
