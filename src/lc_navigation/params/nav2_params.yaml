@@ -1,5 +1,7 @@
 amcl:
   ros__parameters:
+    # 里程计噪声模型，数值越大越认为底盘运动不准。
+    # 常用调参：定位抖动大时适当增大；定位发散或收敛慢时结合实测再细调。
     alpha1: 0.2
     alpha2: 0.2
     alpha3: 0.2
@@ -30,6 +32,8 @@ amcl:
     sigma_hit: 0.2
     tf_broadcast: true
     transform_tolerance: 1.0
+    # AMCL 触发更新的最小角度/位移，数值越小更新越频繁、定位更细，但 CPU 开销更大。
+    # 常用调参：低速小车或原地转动较多时可以适当减小。
     update_min_a: 0.2
     update_min_d: 0.25
     z_hit: 0.5
@@ -67,6 +71,7 @@ bt_navigator:
 
 controller_server:
   ros__parameters:
+    # 控制器主循环频率。频率高，控制更跟手，但算力占用更高。
     controller_frequency: 20.0
     costmap_update_timeout: 0.30
     min_x_velocity_threshold: 0.001
@@ -91,29 +96,39 @@ controller_server:
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
+      # 到点判定容差。常用调参：
+      # xy/yaw 越小，停得越准，但更容易在终点附近反复修正。
       xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.20
     # DWB parameters
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
       debug_trajectory_details: True
+      # 线速度/角速度上下限。
+      # 常用调参：觉得车整体偏慢时，优先看 max_vel_x / max_speed_xy / max_vel_theta。
       min_vel_x: 0.0
       min_vel_y: 0.0
       max_vel_x: 0.40
       max_vel_y: 0.0
-      max_vel_theta: 1.6
+      max_vel_theta: 2.0
       min_speed_xy: 0.0
-      max_speed_xy: 0.35
+      max_speed_xy: 0.40
+      # 原地旋转时的最小角速度。过小会显得转向“肉”，过大可能抖。
       min_speed_theta: 0.35
+      # 加速度限制决定提速/起转有多猛。
+      # 常用调参：起步慢、转起来慢，优先看 acc_lim_x / acc_lim_theta。
       acc_lim_x: 3.0
       acc_lim_y: 0.0
-      acc_lim_theta: 4.0
+      acc_lim_theta: 5.0
       decel_lim_x: -3.0
       decel_lim_y: 0.0
-      decel_lim_theta: -4.0
+      decel_lim_theta: -5.0
+      # 轨迹采样密度，越高越细但计算更重。一般够用就不要盲目加。
       vx_samples: 24
       vy_samples: 5
       vtheta_samples: 32
+      # 前向仿真时间。大了更保守、更平滑；小了更激进、更灵活。
+      # 常用调参：觉得局部规划保守、拐弯慢，可以适当减小。
       sim_time: 0.8
       linear_granularity: 0.05
       angular_granularity: 0.025
@@ -122,6 +137,11 @@ controller_server:
       trans_stopped_velocity: 0.05
       short_circuit_trajectory_evaluation: True
       stateful: True
+      # 这些 critic 权重直接决定“更贴路径”还是“更敢走、更敢转”。
+      # 常用调参：
+      # 1) 终点附近转得太保守：看 RotateToGoal.*
+      # 2) 总想死跟路径导致速度起不来：看 PathAlign / PathDist
+      # 3) 太贴障碍：看 BaseObstacle + 膨胀层
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
       BaseObstacle.scale: 0.02
       PathAlign.scale: 6.0
@@ -130,8 +150,8 @@ controller_server:
       GoalAlign.forward_point_distance: 0.05
       PathDist.scale: 24.0
       GoalDist.scale: 18.0
-      RotateToGoal.scale: 72.0
-      RotateToGoal.slowing_factor: 1.5
+      RotateToGoal.scale: 56.0
+      RotateToGoal.slowing_factor: 1.0
       RotateToGoal.lookahead_time: -1.0
 
 local_costmap:
@@ -145,12 +165,16 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.05
-      robot_radius: 0.22
+      # 机器人外接圆半径。你的车直径 0.4 m，对应半径 0.20 m。
+      # 如果底盘/雷达/外壳有外凸，建议保守设为 0.20~0.21，而不是更大。
+      robot_radius: 0.20
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
+        # 膨胀半径越大越保守，越容易贴着空旷区域中心走，也会显得慢。
+        # 对 0.4 m 小车，0.30~0.35 常见；窄路多时可先试 0.30。
         cost_scaling_factor: 3.0
-        inflation_radius: 0.35
+        inflation_radius: 0.30
       voxel_layer:
         plugin: "nav2_costmap_2d::VoxelLayer"
         enabled: True
@@ -183,7 +207,8 @@ global_costmap:
       publish_frequency: 20.0
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.22
+      # 全局/局部 costmap 的车体尺寸要保持一致。
+      robot_radius: 0.20
       resolution: 0.05
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -209,7 +234,7 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
-        inflation_radius: 0.35
+        inflation_radius: 0.30
       always_send_full_costmap: True
 
 # The yaml_filename does not need to be specified since it going to be set by defaults in launch.
@@ -269,9 +294,11 @@ behavior_server:
     robot_base_frame: base_link
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
+    # 恢复行为（如原地 spin）的角速度上限。
+    # 你现在实测“特别是旋转慢”，这里 1.0 rad/s 偏保守，适当放宽。
+    max_rotational_vel: 1.6
     min_rotational_vel: 0.4
-    rotational_acc_lim: 3.2
+    rotational_acc_lim: 4.0
 
 waypoint_follower:
   ros__parameters:
@@ -289,10 +316,11 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.40, 0.0, 1.6]
-    min_velocity: [-0.30, 0.0, -1.6]
-    max_accel: [3.0, 0.0, 4.0]
-    max_decel: [-3.0, 0.0, -4.0]
+    # 速度平滑器必须和控制器上限匹配，不然前面放开了，后面又被卡住。
+    max_velocity: [0.40, 0.0, 2.0]
+    min_velocity: [-0.30, 0.0, -2.0]
+    max_accel: [3.0, 0.0, 5.0]
+    max_decel: [-3.0, 0.0, -5.0]
     map_topic: "map"
     map_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]
