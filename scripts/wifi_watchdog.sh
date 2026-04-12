@@ -42,6 +42,17 @@ device_state() {
   nmcli -t -f GENERAL.STATE device show "$IFACE" 2>/dev/null | awk -F: '{print $2}'
 }
 
+default_gateway() {
+  ip route show default dev "$IFACE" 2>/dev/null | awk '/default/ {print $3; exit}'
+}
+
+gateway_reachable() {
+  local gw
+  gw="$(default_gateway)"
+  [[ -n "$gw" ]] || return 1
+  ping -I "$IFACE" -c 1 -W 2 "$gw" >/dev/null 2>&1
+}
+
 mark_recovery() {
   mkdir -p "$STATE_DIR"
   date +%s >"$LAST_RECOVERY_FILE"
@@ -99,7 +110,16 @@ nm_state="$(device_state)"
 
 if [[ -n "$recent_kernel_wifi_errors" ]]; then
   if [[ "$nm_state" == "100 (connected)" ]]; then
-    log "recent brcmfmac errors found, but $IFACE is connected; skipping recovery"
+    if gateway_reachable; then
+      log "recent brcmfmac errors found, but $IFACE is connected and gateway responds; skipping recovery"
+      exit 0
+    fi
+    if in_cooldown; then
+      log "recent brcmfmac errors found, connected state is stale, but cooldown is active; skipping recovery"
+      exit 0
+    fi
+    log "recent brcmfmac errors found, $IFACE looks connected but gateway is unreachable"
+    recover_driver
     exit 0
   fi
   if in_cooldown; then
