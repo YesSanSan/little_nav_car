@@ -6,6 +6,9 @@ CONNECTION="${CONNECTION:-fcyy6}"
 LOOKBACK="${LOOKBACK:-3 min ago}"
 LOG_TAG="${LOG_TAG:-wifi-watchdog}"
 RECOVERY_WAIT="${RECOVERY_WAIT:-4}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-180}"
+STATE_DIR="${STATE_DIR:-/run/wifi-watchdog}"
+LAST_RECOVERY_FILE="$STATE_DIR/last_recovery"
 
 log() {
   logger -t "$LOG_TAG" "$*"
@@ -39,8 +42,22 @@ device_state() {
   nmcli -t -f GENERAL.STATE device show "$IFACE" 2>/dev/null | awk -F: '{print $2}'
 }
 
+mark_recovery() {
+  mkdir -p "$STATE_DIR"
+  date +%s >"$LAST_RECOVERY_FILE"
+}
+
+in_cooldown() {
+  [[ -f "$LAST_RECOVERY_FILE" ]] || return 1
+  local last now
+  last="$(cat "$LAST_RECOVERY_FILE" 2>/dev/null || echo 0)"
+  now="$(date +%s)"
+  [[ $((now - last)) -lt "$COOLDOWN_SECONDS" ]]
+}
+
 recover_driver() {
   log "reloading brcmfmac stack on $IFACE"
+  mark_recovery
   nmcli device disconnect "$IFACE" >/dev/null 2>&1 || true
   modprobe -r brcmfmac_wcc brcmfmac brcmutil >/dev/null 2>&1 || true
   sleep 2
@@ -81,6 +98,14 @@ fi
 nm_state="$(device_state)"
 
 if [[ -n "$recent_kernel_wifi_errors" ]]; then
+  if [[ "$nm_state" == "100 (connected)" ]]; then
+    log "recent brcmfmac errors found, but $IFACE is connected; skipping recovery"
+    exit 0
+  fi
+  if in_cooldown; then
+    log "recent brcmfmac errors found, but cooldown is active; skipping recovery"
+    exit 0
+  fi
   log "detected recent brcmfmac timeout signature"
   recover_driver
   exit 0
@@ -88,6 +113,10 @@ fi
 
 if [[ "$nm_state" != "100 (connected)" ]]; then
   log "device state is '$nm_state'"
+  if in_cooldown; then
+    log "cooldown is active; skipping reconnect cycle"
+    exit 0
+  fi
   reconnect_only
   sleep 8
   nm_state="$(device_state)"
