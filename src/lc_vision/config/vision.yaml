@@ -9,7 +9,7 @@
     rgb.publish_fps: 10
     rgb.bitrate_kbps: 1200
     rgb.gop_size: 30
-    rgb.frame_id: camera_color_optical_frame
+    rgb.frame_id: cam_link
 
     depth.enable: true
     depth.width: 640
@@ -18,7 +18,7 @@
     depth.publish_fps: 8
     depth.bitrate_kbps: 500
     depth.gop_size: 24
-    depth.frame_id: camera_depth_optical_frame
+    depth.frame_id: cam_link
     depth.visualization_min_mm: 300
     depth.visualization_max_mm: 5000
     depth.invalid_as_black: true

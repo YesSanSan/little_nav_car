@@ -40,10 +40,26 @@ def generate_launch_description():
         cwd=PathJoinSubstitution([sdk_root, "lib"]),
     )
 
+    lc_vision_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        arguments=[
+            '--x', '0.08',
+            '--y', '0.0',
+            '--z', '0.0',
+            '--yaw', '0.0',
+            '--pitch', '0.0',
+            '--roll', '0.0',
+            '--frame-id', 'base_link',
+            '--child-frame-id', 'cam_link',
+        ],
+    )
+
     return LaunchDescription(
         [
             declare_sdk_root,
             declare_params_file,
             lc_vision_node,
+            lc_vision_tf,
         ]
     )

@@ -803,7 +803,7 @@ void LCVision::getParams() {
     impl_->rgb.publish_fps  = this->declare_parameter<int>("rgb.publish_fps", 10);
     impl_->rgb.bitrate_kbps = this->declare_parameter<int>("rgb.bitrate_kbps", 1200);
     impl_->rgb.gop_size     = this->declare_parameter<int>("rgb.gop_size", 30);
-    impl_->rgb.frame_id     = this->declare_parameter<std::string>("rgb.frame_id", "camera_color_optical_frame");
+    impl_->rgb.frame_id     = this->declare_parameter<std::string>("rgb.frame_id", "cam_link");
 
     impl_->depth.enable               = this->declare_parameter<bool>("depth.enable", true);
     impl_->depth.width                = this->declare_parameter<int>("depth.width", 640);
@@ -812,7 +812,7 @@ void LCVision::getParams() {
     impl_->depth.publish_fps          = this->declare_parameter<int>("depth.publish_fps", 8);
     impl_->depth.bitrate_kbps         = this->declare_parameter<int>("depth.bitrate_kbps", 500);
     impl_->depth.gop_size             = this->declare_parameter<int>("depth.gop_size", 24);
-    impl_->depth.frame_id             = this->declare_parameter<std::string>("depth.frame_id", "camera_depth_optical_frame");
+    impl_->depth.frame_id             = this->declare_parameter<std::string>("depth.frame_id", "cam_link");
     impl_->depth.visualization_min_mm = this->declare_parameter<int>("depth.visualization_min_mm", 300);
     impl_->depth.visualization_max_mm = this->declare_parameter<int>("depth.visualization_max_mm", 5000);
     impl_->depth.invalid_as_black     = this->declare_parameter<bool>("depth.invalid_as_black", true);
