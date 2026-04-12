@@ -16,8 +16,19 @@ set(ASTRA_SDK_ROOT "${DEFAULT_ASTRA_SDK_ROOT}" CACHE PATH "Path to the Astra SDK
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
 
+find_package(ament_index_cpp REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 find_package(PkgConfig REQUIRED)
+
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+  set(VCPKG_TARGET_TRIPLET "arm64-linux")
+endif()
+
+if(NOT ncnn_DIR AND EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/ncnn/ncnnConfig.cmake")
+  set(ncnn_DIR "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/ncnn")
+endif()
+
+find_package(ncnn CONFIG REQUIRED)
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
 
@@ -46,6 +57,7 @@ target_link_libraries(${PROJECT_NAME}
   ${ASTRA_CORE_API_LIBRARY}
   PkgConfig::FFMPEG
   ${OpenCV_LIBRARIES}
+  ncnn
   pthread
 )
 
@@ -72,4 +84,7 @@ ament_auto_package(
   INSTALL_TO_SHARE
     config
     launch
+    models
+    scripts
+    README.md
 )

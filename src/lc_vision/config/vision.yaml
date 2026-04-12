@@ -22,3 +22,11 @@
     depth.visualization_min_mm: 300
     depth.visualization_max_mm: 5000
     depth.invalid_as_black: true
+
+    detector.enable: true
+    detector.model_dir: models/yolo26n_ncnn_model
+    detector.input_size: 640
+    detector.score_threshold: 0.25
+    detector.nms_threshold: 0.45
+    detector.fps: 5
+    detector.target_classes: ["person"]

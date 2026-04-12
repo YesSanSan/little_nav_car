@@ -3,14 +3,22 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
+#include <regex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -25,8 +33,12 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <astra/astra.hpp>
 #include <foxglove_msgs/msg/compressed_video.hpp>
+#include <net.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <rclcpp/logging.hpp>
 #include <rclcpp/qos.hpp>
 
@@ -37,11 +49,76 @@ namespace lc_vision {
 namespace {
 
 using namespace std::chrono_literals;
+namespace fs = std::filesystem;
+
+struct ParsedMetadata {
+    int                      input_size = 0;
+    std::vector<std::string> class_names;
+};
+
+struct Detection {
+    cv::Rect    box;
+    float       score = 0.0f;
+    int         class_id = -1;
+    std::string label;
+};
 
 std::string avErrorToString(const int error_code) {
     char buffer[AV_ERROR_MAX_STRING_SIZE] = {0};
     av_strerror(error_code, buffer, sizeof(buffer));
     return std::string(buffer);
+}
+
+std::string trim(const std::string &value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string toLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return value;
+}
+
+std::string unquote(const std::string &value) {
+    const auto trimmed = trim(value);
+    if (trimmed.size() >= 2 &&
+        ((trimmed.front() == '"' && trimmed.back() == '"') || (trimmed.front() == '\'' && trimmed.back() == '\''))) {
+        return trimmed.substr(1, trimmed.size() - 2);
+    }
+    return trimmed;
+}
+
+int parseFirstInteger(const std::string &line) {
+    static const std::regex kIntegerRegex(R"((-?\d+))");
+    std::smatch              match;
+    if (!std::regex_search(line, match, kIntegerRegex)) {
+        return 0;
+    }
+    return std::stoi(match.str(1));
+}
+
+std::vector<std::string> defaultCocoClassNames() {
+    return {
+        "person",        "bicycle",      "car",           "motorcycle",    "airplane",      "bus",
+        "train",         "truck",        "boat",          "traffic light", "fire hydrant",  "stop sign",
+        "parking meter", "bench",        "bird",          "cat",           "dog",           "horse",
+        "sheep",         "cow",          "elephant",      "bear",          "zebra",         "giraffe",
+        "backpack",      "umbrella",     "handbag",       "tie",           "suitcase",      "frisbee",
+        "skis",          "snowboard",    "sports ball",   "kite",          "baseball bat",  "baseball glove",
+        "skateboard",    "surfboard",    "tennis racket", "bottle",        "wine glass",    "cup",
+        "fork",          "knife",        "spoon",         "bowl",          "banana",        "apple",
+        "sandwich",      "orange",       "broccoli",      "carrot",        "hot dog",       "pizza",
+        "donut",         "cake",         "chair",         "couch",         "potted plant",  "bed",
+        "dining table",  "toilet",       "tv",            "laptop",        "mouse",         "remote",
+        "keyboard",      "cell phone",   "microwave",     "oven",          "toaster",       "sink",
+        "refrigerator",  "book",         "clock",         "vase",          "scissors",      "teddy bear",
+        "hair drier",    "toothbrush"};
 }
 
 std::string expandHomeDirectory(const std::string &path) {
@@ -127,6 +204,166 @@ std::vector<uint8_t> extractAnnexBExtradata(const AVCodecContext *codec_context)
     return annexb;
 }
 
+ParsedMetadata parseMetadataFile(const fs::path &metadata_path) {
+    ParsedMetadata result;
+    std::ifstream  input(metadata_path);
+    if (!input.is_open()) {
+        return result;
+    }
+
+    bool in_names_block = false;
+    for (std::string line; std::getline(input, line);) {
+        const auto trimmed = trim(line);
+        if (trimmed.empty() || trimmed.starts_with('#')) {
+            continue;
+        }
+
+        if (trimmed.starts_with("imgsz:")) {
+            const int parsed = parseFirstInteger(trimmed);
+            if (parsed > 0) {
+                result.input_size = parsed;
+            }
+            in_names_block = false;
+            continue;
+        }
+
+        if (trimmed.starts_with("names:")) {
+            const auto inline_names = trim(trimmed.substr(std::string("names:").size()));
+            if (!inline_names.empty() && inline_names.front() == '{' && inline_names.back() == '}') {
+                static const std::regex item_regex(R"((\d+)\s*:\s*['"]?([^,'"}]+)['"]?)");
+                for (auto it = std::sregex_iterator(inline_names.begin(), inline_names.end(), item_regex);
+                     it != std::sregex_iterator();
+                     ++it) {
+                    const int index = std::stoi((*it)[1].str());
+                    if (index >= static_cast<int>(result.class_names.size())) {
+                        result.class_names.resize(static_cast<size_t>(index) + 1U);
+                    }
+                    result.class_names[static_cast<size_t>(index)] = trim((*it)[2].str());
+                }
+                in_names_block = false;
+            } else {
+                in_names_block = true;
+            }
+            continue;
+        }
+
+        if (!in_names_block) {
+            continue;
+        }
+
+        std::smatch match;
+        if (std::regex_match(trimmed, match, std::regex(R"((\d+)\s*:\s*(.+))"))) {
+            const int         index = std::stoi(match.str(1));
+            const std::string name  = unquote(match.str(2));
+            if (index >= static_cast<int>(result.class_names.size())) {
+                result.class_names.resize(static_cast<size_t>(index) + 1U);
+            }
+            result.class_names[static_cast<size_t>(index)] = name;
+            continue;
+        }
+
+        in_names_block = false;
+    }
+
+    return result;
+}
+
+float intersectionOverUnion(const cv::Rect2f &a, const cv::Rect2f &b) {
+    const float x1 = std::max(a.x, b.x);
+    const float y1 = std::max(a.y, b.y);
+    const float x2 = std::min(a.x + a.width, b.x + b.width);
+    const float y2 = std::min(a.y + a.height, b.y + b.height);
+
+    const float intersection_w = std::max(0.0f, x2 - x1);
+    const float intersection_h = std::max(0.0f, y2 - y1);
+    const float intersection   = intersection_w * intersection_h;
+    const float union_area     = a.area() + b.area() - intersection;
+
+    if (union_area <= 0.0f) {
+        return 0.0f;
+    }
+    return intersection / union_area;
+}
+
+void applyNms(std::vector<Detection> &detections, const float iou_threshold) {
+    std::sort(detections.begin(), detections.end(), [](const Detection &lhs, const Detection &rhs) {
+        return lhs.score > rhs.score;
+    });
+
+    std::vector<Detection> filtered;
+    std::vector<bool>      suppressed(detections.size(), false);
+
+    for (size_t i = 0; i < detections.size(); ++i) {
+        if (suppressed[i]) {
+            continue;
+        }
+
+        filtered.push_back(detections[i]);
+        const cv::Rect2f lhs_rect(
+            static_cast<float>(detections[i].box.x), static_cast<float>(detections[i].box.y),
+            static_cast<float>(detections[i].box.width), static_cast<float>(detections[i].box.height));
+
+        for (size_t j = i + 1; j < detections.size(); ++j) {
+            if (suppressed[j] || detections[i].class_id != detections[j].class_id) {
+                continue;
+            }
+
+            const cv::Rect2f rhs_rect(
+                static_cast<float>(detections[j].box.x), static_cast<float>(detections[j].box.y),
+                static_cast<float>(detections[j].box.width), static_cast<float>(detections[j].box.height));
+
+            if (intersectionOverUnion(lhs_rect, rhs_rect) > iou_threshold) {
+                suppressed[j] = true;
+            }
+        }
+    }
+
+    detections = std::move(filtered);
+}
+
+void drawDetections(cv::Mat &image, const std::vector<Detection> &detections, const cv::Size &source_size) {
+    if (image.empty() || source_size.width <= 0 || source_size.height <= 0) {
+        return;
+    }
+
+    const float scale_x = static_cast<float>(image.cols) / static_cast<float>(source_size.width);
+    const float scale_y = static_cast<float>(image.rows) / static_cast<float>(source_size.height);
+    const int   thickness = std::max(1, std::min(image.cols, image.rows) / 240);
+    const int   font_thickness = std::max(1, thickness);
+    const double font_scale = std::max(0.45, std::min(image.cols, image.rows) / 800.0);
+
+    for (const auto &detection : detections) {
+        cv::Rect scaled_box(
+            static_cast<int>(std::lround(static_cast<float>(detection.box.x) * scale_x)),
+            static_cast<int>(std::lround(static_cast<float>(detection.box.y) * scale_y)),
+            static_cast<int>(std::lround(static_cast<float>(detection.box.width) * scale_x)),
+            static_cast<int>(std::lround(static_cast<float>(detection.box.height) * scale_y)));
+        scaled_box &= cv::Rect(0, 0, image.cols, image.rows);
+
+        if (scaled_box.width <= 1 || scaled_box.height <= 1) {
+            continue;
+        }
+
+        const std::string caption =
+            detection.label + " " + cv::format("%.2f", static_cast<double>(detection.score));
+
+        int       baseline = 0;
+        const auto text_size =
+            cv::getTextSize(caption, cv::FONT_HERSHEY_SIMPLEX, font_scale, font_thickness, &baseline);
+        const int text_x = std::max(0, scaled_box.x);
+        const int text_y = std::max(text_size.height + baseline + 4, scaled_box.y);
+        const int bg_y   = text_y - text_size.height - baseline - 4;
+        const int bg_w   = std::min(text_size.width + 8, image.cols - text_x);
+        const int bg_h   = text_size.height + baseline + 8;
+
+        cv::rectangle(image, scaled_box, cv::Scalar(0, 255, 0), thickness, cv::LINE_AA);
+        cv::rectangle(image, cv::Rect(text_x, bg_y, bg_w, bg_h), cv::Scalar(0, 96, 0), cv::FILLED);
+        cv::putText(
+            image, caption, cv::Point(text_x + 4, text_y - 4), cv::FONT_HERSHEY_SIMPLEX, font_scale,
+            cv::Scalar(255, 255, 255), font_thickness, cv::LINE_AA);
+    }
+}
+
 class VideoEncoder {
 public:
     VideoEncoder() = default;
@@ -136,8 +373,8 @@ public:
     }
 
     void initialize(
-        const std::string &stream_name, const int width, const int height, const int fps,
-        const int bitrate_kbps, const int gop_size, const AVPixelFormat input_format) {
+        const std::string &stream_name, const int width, const int height, const int fps, const int bitrate_kbps,
+        const int gop_size, const AVPixelFormat input_format) {
         reset();
 
         stream_name_    = stream_name;
@@ -208,8 +445,8 @@ public:
         }
 
         sws_context_ = sws_getCachedContext(
-            nullptr, width_, height_, input_format_, width_, height_, codec_context_->pix_fmt,
-            SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+            nullptr, width_, height_, input_format_, width_, height_, codec_context_->pix_fmt, SWS_FAST_BILINEAR,
+            nullptr, nullptr, nullptr);
         if (sws_context_ == nullptr) {
             throw std::runtime_error("Failed to create swscale context for " + stream_name_);
         }
@@ -226,8 +463,8 @@ public:
             return std::nullopt;
         }
 
-        const uint8_t *src_data[4]   = {data, nullptr, nullptr, nullptr};
-        int            src_lines[4]  = {stride_bytes, 0, 0, 0};
+        const uint8_t *src_data[4] = {data, nullptr, nullptr, nullptr};
+        int            src_lines[4] = {stride_bytes, 0, 0, 0};
 
         const int writable_result = av_frame_make_writable(frame_);
         if (writable_result < 0) {
@@ -245,7 +482,6 @@ public:
         }
 
         std::vector<uint8_t> encoded_frame;
-
         while (true) {
             const int receive_result = avcodec_receive_packet(codec_context_, packet_);
             if (receive_result == AVERROR(EAGAIN) || receive_result == AVERROR_EOF) {
@@ -259,6 +495,7 @@ public:
             if ((packet_->flags & AV_PKT_FLAG_KEY) != 0 && !annexb_extradata_.empty()) {
                 encoded_frame.insert(encoded_frame.end(), annexb_extradata_.begin(), annexb_extradata_.end());
             }
+
             encoded_frame.insert(encoded_frame.end(), packet_->data, packet_->data + packet_->size);
             av_packet_unref(packet_);
         }
@@ -266,7 +503,6 @@ public:
         if (encoded_frame.empty()) {
             return std::nullopt;
         }
-
         return encoded_frame;
     }
 
@@ -282,15 +518,12 @@ public:
             sws_freeContext(sws_context_);
             sws_context_ = nullptr;
         }
-
         if (packet_ != nullptr) {
             av_packet_free(&packet_);
         }
-
         if (frame_ != nullptr) {
             av_frame_free(&frame_);
         }
-
         if (codec_context_ != nullptr) {
             avcodec_free_context(&codec_context_);
         }
@@ -310,12 +543,12 @@ private:
 
     std::vector<uint8_t> annexb_extradata_;
     std::string          stream_name_;
-    AVPixelFormat        input_format_  = AV_PIX_FMT_NONE;
-    int                  width_         = 0;
-    int                  height_        = 0;
-    int                  fps_           = 0;
-    int                  bitrate_bps_   = 0;
-    int                  gop_size_      = 0;
+    AVPixelFormat        input_format_ = AV_PIX_FMT_NONE;
+    int                  width_        = 0;
+    int                  height_       = 0;
+    int                  fps_          = 0;
+    int                  bitrate_bps_  = 0;
+    int                  gop_size_     = 0;
     int64_t              frame_counter_ = 0;
 };
 
@@ -344,7 +577,6 @@ astra::ImageStreamMode selectBestMode(
         if (mode.pixel_format() != requested_format) {
             cost += 1000000;
         }
-
         cost += std::abs(static_cast<int>(mode.width()) - requested_width) * 1000;
         cost += std::abs(static_cast<int>(mode.height()) - requested_height) * 1000;
         cost += std::abs(static_cast<int>(mode.fps()) - requested_fps);
@@ -360,13 +592,13 @@ astra::ImageStreamMode selectBestMode(
 
 struct LCVision::Impl {
     struct StreamConfig {
-        bool        enable      = true;
-        int         width       = 640;
-        int         height      = 480;
-        int         capture_fps = 15;
-        int         publish_fps = 10;
+        bool        enable       = true;
+        int         width        = 640;
+        int         height       = 480;
+        int         capture_fps  = 15;
+        int         publish_fps  = 10;
         int         bitrate_kbps = 1200;
-        int         gop_size    = 30;
+        int         gop_size     = 30;
         std::string frame_id;
     };
 
@@ -376,15 +608,37 @@ struct LCVision::Impl {
         bool invalid_as_black     = true;
     };
 
+    struct DetectorConfig {
+        bool                     enable           = true;
+        std::string              model_dir;
+        int                      input_size       = 640;
+        float                    score_threshold  = 0.25f;
+        float                    nms_threshold    = 0.45f;
+        int                      fps              = 5;
+        std::vector<std::string> target_classes   = {"person"};
+        std::vector<std::string> class_names      = defaultCocoClassNames();
+        std::set<int>            target_class_ids = {0};
+    };
+
     template<typename T>
     struct FrameBuffer {
-        std::mutex      mutex;
-        std::vector<T>  data;
-        int             width       = 0;
-        int             height      = 0;
-        int64_t         frame_index = -1;
-        rclcpp::Time    stamp;
-        bool            available   = false;
+        std::mutex     mutex;
+        std::vector<T> data;
+        int            width       = 0;
+        int            height      = 0;
+        int64_t        frame_index = -1;
+        rclcpp::Time   stamp;
+        bool           available = false;
+    };
+
+    struct DetectionCache {
+        std::mutex           mutex;
+        std::vector<Detection> detections;
+        int                  width       = 0;
+        int                  height      = 0;
+        int64_t              frame_index = -1;
+        rclcpp::Time         stamp;
+        bool                 available = false;
     };
 
     class CaptureListener : public astra::FrameListener {
@@ -412,6 +666,49 @@ struct LCVision::Impl {
     explicit Impl(LCVision &node)
         : node(node),
           capture_listener(std::make_unique<CaptureListener>(*this)) {
+    }
+
+    fs::path resolveModelDirectory() const {
+        fs::path model_path = fs::path(expandHomeDirectory(detector.model_dir));
+        if (model_path.is_absolute()) {
+            return model_path;
+        }
+
+        try {
+            const auto package_share = fs::path(ament_index_cpp::get_package_share_directory("lc_vision"));
+            const auto installed_path = package_share / model_path;
+            if (fs::exists(installed_path)) {
+                return installed_path;
+            }
+        } catch (...) {
+        }
+
+        const fs::path source_package_dir = fs::path(__FILE__).parent_path().parent_path();
+        const fs::path source_path        = source_package_dir / model_path;
+        if (fs::exists(source_path)) {
+            return source_path;
+        }
+
+        return model_path;
+    }
+
+    void updateTargetClassIds() {
+        detector.target_class_ids.clear();
+
+        std::set<std::string> requested;
+        for (const auto &name : detector.target_classes) {
+            requested.insert(toLower(name));
+        }
+
+        for (size_t i = 0; i < detector.class_names.size(); ++i) {
+            if (requested.contains(toLower(detector.class_names[i]))) {
+                detector.target_class_ids.insert(static_cast<int>(i));
+            }
+        }
+
+        if (detector.target_class_ids.empty() && requested.contains("person") && !detector.class_names.empty()) {
+            detector.target_class_ids.insert(0);
+        }
     }
 
     void storeColorFrame(const astra::ColorFrame &frame) {
@@ -444,6 +741,257 @@ struct LCVision::Impl {
         frame.copy_to(depth_buffer.data.data());
     }
 
+    void updateDetectionCache(
+        std::vector<Detection> detections, const int width, const int height, const int64_t frame_index,
+        const rclcpp::Time &stamp) {
+        std::lock_guard<std::mutex> lock(detection_cache.mutex);
+        detection_cache.detections  = std::move(detections);
+        detection_cache.width       = width;
+        detection_cache.height      = height;
+        detection_cache.frame_index = frame_index;
+        detection_cache.stamp       = stamp;
+        detection_cache.available   = true;
+    }
+
+    std::vector<Detection> snapshotDetections(cv::Size &source_size) {
+        std::lock_guard<std::mutex> lock(detection_cache.mutex);
+        source_size = cv::Size(detection_cache.width, detection_cache.height);
+        return detection_cache.detections;
+    }
+
+    bool copyLatestRgbFrame(std::vector<uint8_t> &rgb_data, int &width, int &height, int64_t &frame_index, rclcpp::Time &stamp) {
+        std::lock_guard<std::mutex> lock(rgb_buffer.mutex);
+        if (!rgb_buffer.available || rgb_buffer.frame_index == last_detection_input_frame_index) {
+            return false;
+        }
+
+        rgb_data     = rgb_buffer.data;
+        width        = rgb_buffer.width;
+        height       = rgb_buffer.height;
+        frame_index  = rgb_buffer.frame_index;
+        stamp        = rgb_buffer.stamp;
+        return !rgb_data.empty() && width > 0 && height > 0;
+    }
+
+    std::vector<Detection> runDetection(
+        const std::vector<uint8_t> &rgb_data, const int width, const int height, const int input_size) {
+        if (!detector_ready || rgb_data.empty() || width <= 0 || height <= 0) {
+            return {};
+        }
+
+        cv::Mat rgb(height, width, CV_8UC3, const_cast<uint8_t *>(rgb_data.data()));
+
+        const float scale = std::min(
+            static_cast<float>(input_size) / static_cast<float>(width),
+            static_cast<float>(input_size) / static_cast<float>(height));
+        const int resized_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(width) * scale)));
+        const int resized_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(height) * scale)));
+        const int pad_w     = std::max(0, input_size - resized_w);
+        const int pad_h     = std::max(0, input_size - resized_h);
+        const int pad_left  = pad_w / 2;
+        const int pad_top   = pad_h / 2;
+
+        cv::Mat resized;
+        cv::resize(rgb, resized, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_LINEAR);
+
+        cv::Mat padded(input_size, input_size, CV_8UC3, cv::Scalar(114, 114, 114));
+        resized.copyTo(padded(cv::Rect(pad_left, pad_top, resized_w, resized_h)));
+
+        ncnn::Mat input = ncnn::Mat::from_pixels(padded.data, ncnn::Mat::PIXEL_RGB, input_size, input_size);
+        const float norm_vals[3] = {1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f};
+        input.substract_mean_normalize(nullptr, norm_vals);
+
+        ncnn::Extractor extractor = detector_net.create_extractor();
+        extractor.set_light_mode(true);
+
+        int input_result = -1;
+#if NCNN_STRING
+        if (!detector_input_name.empty()) {
+            input_result = extractor.input(detector_input_name.c_str(), input);
+        } else
+#endif
+        {
+            input_result = extractor.input(detector_input_index, input);
+        }
+        if (input_result != 0) {
+            throw std::runtime_error("Failed to feed detector input into NCNN extractor");
+        }
+
+        if (detector_output_names.empty() && detector_output_indexes.empty()) {
+            throw std::runtime_error("NCNN model has no output blobs");
+        }
+
+        ncnn::Mat output;
+        int extract_result = -1;
+#if NCNN_STRING
+        std::string output_name;
+        if (!detector_output_names.empty()) {
+            output_name     = detector_output_names.front();
+            extract_result = extractor.extract(output_name.c_str(), output);
+        } else
+#endif
+        {
+            extract_result = extractor.extract(detector_output_indexes.front(), output);
+        }
+        if (extract_result != 0) {
+            throw std::runtime_error("Failed to extract NCNN detector output");
+        }
+
+        const int class_count = std::max(1, static_cast<int>(detector.class_names.size()));
+        const int attr_count  = class_count + 4;
+        const float inv_scale = 1.0f / std::max(scale, 1e-6f);
+
+        enum class Layout {
+            AttrByBoxes,
+            BoxesByAttr,
+            ChannelsByBoxes
+        };
+
+        Layout layout;
+        int    num_boxes = 0;
+
+        if (output.dims == 2) {
+            if (output.h == attr_count) {
+                layout   = Layout::AttrByBoxes;
+                num_boxes = output.w;
+            } else if (output.w == attr_count) {
+                layout   = Layout::BoxesByAttr;
+                num_boxes = output.h;
+            } else {
+                throw std::runtime_error(
+                    "Unsupported NCNN detection tensor shape " + std::to_string(output.w) + "x" +
+                    std::to_string(output.h));
+            }
+        } else if (output.dims == 3) {
+            if (output.c == 1 && output.h == attr_count) {
+                layout   = Layout::AttrByBoxes;
+                num_boxes = output.w;
+            } else if (output.c == 1 && output.w == attr_count) {
+                layout   = Layout::BoxesByAttr;
+                num_boxes = output.h;
+            } else if (output.c == attr_count) {
+                layout   = Layout::ChannelsByBoxes;
+                num_boxes = output.w * output.h;
+            } else {
+                throw std::runtime_error(
+                    "Unsupported NCNN detection tensor dims c=" + std::to_string(output.c) + " h=" +
+                    std::to_string(output.h) + " w=" + std::to_string(output.w));
+            }
+        } else {
+            throw std::runtime_error("Unsupported NCNN output dims: " + std::to_string(output.dims));
+        }
+
+        const auto value_at = [&](const int attr_index, const int box_index) -> float {
+            switch (layout) {
+            case Layout::AttrByBoxes: {
+                const float *data = static_cast<const float *>(output.data);
+                return data[attr_index * num_boxes + box_index];
+            }
+            case Layout::BoxesByAttr: {
+                const float *data = static_cast<const float *>(output.data);
+                return data[box_index * attr_count + attr_index];
+            }
+            case Layout::ChannelsByBoxes: {
+                const float *channel = output.channel(attr_index);
+                return channel[box_index];
+            }
+            }
+            return 0.0f;
+        };
+
+        std::vector<Detection> detections;
+        detections.reserve(static_cast<size_t>(num_boxes / 8 + 1));
+
+        for (int box_index = 0; box_index < num_boxes; ++box_index) {
+            int   best_class = -1;
+            float best_score = 0.0f;
+
+            for (int class_index = 0; class_index < class_count; ++class_index) {
+                if (!detector.target_class_ids.empty() && !detector.target_class_ids.contains(class_index)) {
+                    continue;
+                }
+
+                const float score = value_at(class_index + 4, box_index);
+                if (score > best_score) {
+                    best_score = score;
+                    best_class = class_index;
+                }
+            }
+
+            if (best_class < 0 || best_score < detector.score_threshold) {
+                continue;
+            }
+
+            const float center_x = value_at(0, box_index);
+            const float center_y = value_at(1, box_index);
+            const float box_w    = value_at(2, box_index);
+            const float box_h    = value_at(3, box_index);
+
+            const float left   = ((center_x - box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
+            const float top    = ((center_y - box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
+            const float right  = ((center_x + box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
+            const float bottom = ((center_y + box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
+
+            const int x1 = std::clamp(static_cast<int>(std::floor(left)), 0, width - 1);
+            const int y1 = std::clamp(static_cast<int>(std::floor(top)), 0, height - 1);
+            const int x2 = std::clamp(static_cast<int>(std::ceil(right)), x1 + 1, width);
+            const int y2 = std::clamp(static_cast<int>(std::ceil(bottom)), y1 + 1, height);
+
+            Detection detection;
+            detection.box      = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+            detection.score    = best_score;
+            detection.class_id = best_class;
+            detection.label    = best_class < static_cast<int>(detector.class_names.size())
+                                     ? detector.class_names[static_cast<size_t>(best_class)]
+                                     : std::to_string(best_class);
+            detections.push_back(std::move(detection));
+        }
+
+        applyNms(detections, detector.nms_threshold);
+        return detections;
+    }
+
+    void detectionLoop() {
+        auto next_detection_time = std::chrono::steady_clock::now();
+        const auto detection_period =
+            std::chrono::milliseconds(std::max(1, 1000 / std::max(1, detector.fps)));
+
+        while (rclcpp::ok() && running.load()) {
+            if (!detector_ready || !detector_runtime_enabled.load()) {
+                std::this_thread::sleep_for(50ms);
+                continue;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_detection_time) {
+                std::this_thread::sleep_for(2ms);
+                continue;
+            }
+
+            std::vector<uint8_t> rgb_data;
+            rclcpp::Time         stamp;
+            int                  width       = 0;
+            int                  height      = 0;
+            int64_t              frame_index = -1;
+            if (!copyLatestRgbFrame(rgb_data, width, height, frame_index, stamp)) {
+                std::this_thread::sleep_for(5ms);
+                continue;
+            }
+
+            next_detection_time = now + detection_period;
+            last_detection_input_frame_index = frame_index;
+
+            try {
+                auto detections = runDetection(rgb_data, width, height, detector.input_size);
+                updateDetectionCache(std::move(detections), width, height, frame_index, stamp);
+            } catch (const std::exception &ex) {
+                detector_runtime_enabled.store(false);
+                RCLCPP_ERROR(node.get_logger(), "NCNN inference failed, detector disabled: %s", ex.what());
+                updateDetectionCache({}, width, height, frame_index, stamp);
+            }
+        }
+    }
+
     [[nodiscard]] std::optional<foxglove_msgs::msg::CompressedVideo> makeRgbMessage() {
         std::vector<uint8_t> rgb_data;
         rclcpp::Time         stamp;
@@ -457,25 +1005,31 @@ struct LCVision::Impl {
                 return std::nullopt;
             }
 
-            rgb_data    = rgb_buffer.data;
-            stamp       = rgb_buffer.stamp;
-            width       = rgb_buffer.width;
-            height      = rgb_buffer.height;
-            frame_index = rgb_buffer.frame_index;
+            rgb_data     = rgb_buffer.data;
+            stamp        = rgb_buffer.stamp;
+            width        = rgb_buffer.width;
+            height       = rgb_buffer.height;
+            frame_index  = rgb_buffer.frame_index;
         }
 
         if (width <= 0 || height <= 0 || rgb_data.empty()) {
             return std::nullopt;
         }
 
+        if (detector_runtime_enabled.load()) {
+            cv::Size source_size;
+            auto     detections = snapshotDetections(source_size);
+            cv::Mat  rgb(height, width, CV_8UC3, rgb_data.data());
+            drawDetections(rgb, detections, source_size);
+        }
+
         if (rgb_encoder_width != width || rgb_encoder_height != height) {
             rgb_encoder.initialize("rgb", width, height, rgb.publish_fps, rgb.bitrate_kbps, rgb.gop_size, AV_PIX_FMT_RGB24);
-            rgb_encoder_width = width;
+            rgb_encoder_width  = width;
             rgb_encoder_height = height;
             RCLCPP_INFO(
-                node.get_logger(),
-                "Initialized RGB encoder: %dx%d @ %d fps, %d kbps, GOP %d",
-                width, height, rgb.publish_fps, rgb.bitrate_kbps, rgb.gop_size);
+                node.get_logger(), "Initialized RGB encoder: %dx%d @ %d fps, %d kbps, GOP %d", width, height,
+                rgb.publish_fps, rgb.bitrate_kbps, rgb.gop_size);
         }
 
         const auto encoded = rgb_encoder.encode(rgb_data.data(), width * 3);
@@ -506,11 +1060,11 @@ struct LCVision::Impl {
                 return std::nullopt;
             }
 
-            depth_data   = depth_buffer.data;
-            stamp        = depth_buffer.stamp;
-            width        = depth_buffer.width;
-            height       = depth_buffer.height;
-            frame_index  = depth_buffer.frame_index;
+            depth_data    = depth_buffer.data;
+            stamp         = depth_buffer.stamp;
+            width         = depth_buffer.width;
+            height        = depth_buffer.height;
+            frame_index   = depth_buffer.frame_index;
         }
 
         if (width <= 0 || height <= 0 || depth_data.empty()) {
@@ -530,23 +1084,32 @@ struct LCVision::Impl {
                 continue;
             }
 
-            const float clamped = std::clamp(static_cast<float>(depth_mm), min_mm, max_mm);
+            const float clamped    = std::clamp(static_cast<float>(depth_mm), min_mm, max_mm);
             const float normalized = 1.0f - ((clamped - min_mm) / range);
             depth_visualization[i] = static_cast<uint8_t>(std::clamp(std::lround(normalized * 255.0f), 0L, 255L));
         }
 
-        if (depth_encoder_width != width || depth_encoder_height != height) {
-            depth_encoder.initialize(
-                "depth", width, height, depth.publish_fps, depth.bitrate_kbps, depth.gop_size, AV_PIX_FMT_GRAY8);
-            depth_encoder_width = width;
-            depth_encoder_height = height;
-            RCLCPP_INFO(
-                node.get_logger(),
-                "Initialized depth encoder: %dx%d @ %d fps, %d kbps, GOP %d",
-                width, height, depth.publish_fps, depth.bitrate_kbps, depth.gop_size);
+        cv::Mat depth_gray(height, width, CV_8UC1, depth_visualization.data());
+        cv::Mat depth_rgb;
+        cv::cvtColor(depth_gray, depth_rgb, cv::COLOR_GRAY2RGB);
+
+        if (detector_runtime_enabled.load()) {
+            cv::Size source_size;
+            auto     detections = snapshotDetections(source_size);
+            drawDetections(depth_rgb, detections, source_size);
         }
 
-        const auto encoded = depth_encoder.encode(depth_visualization.data(), width);
+        if (depth_encoder_width != width || depth_encoder_height != height) {
+            depth_encoder.initialize(
+                "depth", width, height, depth.publish_fps, depth.bitrate_kbps, depth.gop_size, AV_PIX_FMT_RGB24);
+            depth_encoder_width  = width;
+            depth_encoder_height = height;
+            RCLCPP_INFO(
+                node.get_logger(), "Initialized depth encoder: %dx%d @ %d fps, %d kbps, GOP %d", width, height,
+                depth.publish_fps, depth.bitrate_kbps, depth.gop_size);
+        }
+
+        const auto encoded = depth_encoder.encode(depth_rgb.data, width * 3);
         if (!encoded.has_value()) {
             return std::nullopt;
         }
@@ -566,18 +1129,19 @@ struct LCVision::Impl {
     std::string sdk_root;
     StreamConfig rgb;
     DepthConfig  depth;
+    DetectorConfig detector;
 
     astra::StreamSet    stream_set;
     astra::StreamReader reader;
 
     FrameBuffer<uint8_t> rgb_buffer;
     FrameBuffer<int16_t> depth_buffer;
+    DetectionCache       detection_cache;
 
     VideoEncoder rgb_encoder;
     VideoEncoder depth_encoder;
 
     std::vector<uint8_t> depth_visualization;
-
     std::unique_ptr<CaptureListener> capture_listener;
 
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr rgb_video_pub;
@@ -585,16 +1149,26 @@ struct LCVision::Impl {
 
     std::thread capture_thread;
     std::thread publish_thread;
+    std::thread detection_thread;
 
     std::atomic<bool> running{false};
-    bool              astra_initialized = false;
+    std::atomic<bool> detector_runtime_enabled{false};
+    bool              detector_ready     = false;
+    bool              astra_initialized  = false;
 
-    int64_t last_rgb_frame_index   = -1;
-    int64_t last_depth_frame_index = -1;
-    int     rgb_encoder_width      = 0;
-    int     rgb_encoder_height     = 0;
-    int     depth_encoder_width    = 0;
-    int     depth_encoder_height   = 0;
+    ncnn::Net                detector_net;
+    int                      detector_input_index = 0;
+    std::string              detector_input_name;
+    std::vector<int>         detector_output_indexes;
+    std::vector<std::string> detector_output_names;
+
+    int64_t last_rgb_frame_index             = -1;
+    int64_t last_depth_frame_index           = -1;
+    int64_t last_detection_input_frame_index = -1;
+    int     rgb_encoder_width                = 0;
+    int     rgb_encoder_height               = 0;
+    int     depth_encoder_width              = 0;
+    int     depth_encoder_height             = 0;
 };
 
 LCVision::LCVision(const rclcpp::NodeOptions &options)
@@ -637,9 +1211,8 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
 
             const auto active_mode = color_stream.mode();
             RCLCPP_INFO(
-                get_logger(),
-                "Configured RGB stream: %ux%u @ %u fps (mirroring disabled)",
-                active_mode.width(), active_mode.height(), active_mode.fps());
+                get_logger(), "Configured RGB stream: %ux%u @ %u fps (mirroring disabled)", active_mode.width(),
+                active_mode.height(), active_mode.fps());
 
             auto video_qos = rclcpp::QoS(rclcpp::KeepLast(5));
             video_qos.reliable();
@@ -661,9 +1234,8 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
 
             const auto active_mode = depth_stream.mode();
             RCLCPP_INFO(
-                get_logger(),
-                "Configured depth stream: %ux%u @ %u fps (mirroring disabled)",
-                active_mode.width(), active_mode.height(), active_mode.fps());
+                get_logger(), "Configured depth stream: %ux%u @ %u fps (mirroring disabled)", active_mode.width(),
+                active_mode.height(), active_mode.fps());
 
             auto video_qos = rclcpp::QoS(rclcpp::KeepLast(5));
             video_qos.reliable();
@@ -683,6 +1255,12 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 }
             }
         });
+
+        if (impl_->detector_runtime_enabled.load()) {
+            impl_->detection_thread = std::thread([this]() {
+                impl_->detectionLoop();
+            });
+        }
 
         impl_->publish_thread = std::thread([this]() {
             auto next_rgb_publish_time   = std::chrono::steady_clock::now();
@@ -729,6 +1307,9 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
         if (impl_->publish_thread.joinable()) {
             impl_->publish_thread.join();
         }
+        if (impl_->detection_thread.joinable()) {
+            impl_->detection_thread.join();
+        }
         if (impl_->capture_thread.joinable()) {
             impl_->capture_thread.join();
         }
@@ -748,7 +1329,9 @@ LCVision::~LCVision() {
     if (impl_->publish_thread.joinable()) {
         impl_->publish_thread.join();
     }
-
+    if (impl_->detection_thread.joinable()) {
+        impl_->detection_thread.join();
+    }
     if (impl_->capture_thread.joinable()) {
         impl_->capture_thread.join();
     }
@@ -817,21 +1400,130 @@ void LCVision::getParams() {
     impl_->depth.visualization_max_mm = this->declare_parameter<int>("depth.visualization_max_mm", 5000);
     impl_->depth.invalid_as_black     = this->declare_parameter<bool>("depth.invalid_as_black", true);
 
+    impl_->detector.enable = this->declare_parameter<bool>("detector.enable", true);
+    impl_->detector.model_dir =
+        this->declare_parameter<std::string>("detector.model_dir", "models/yolo26n_ncnn_model");
+    impl_->detector.input_size      = this->declare_parameter<int>("detector.input_size", 640);
+    impl_->detector.score_threshold = this->declare_parameter<double>("detector.score_threshold", 0.25);
+    impl_->detector.nms_threshold   = this->declare_parameter<double>("detector.nms_threshold", 0.45);
+    impl_->detector.fps             = this->declare_parameter<int>("detector.fps", 5);
+    impl_->detector.target_classes =
+        this->declare_parameter<std::vector<std::string>>("detector.target_classes", std::vector<std::string>{"person"});
+
     RCLCPP_INFO(
-        get_logger(),
-        "RGB config: enable=%s capture=%dx%d@%d publish=%d bitrate=%dkbps gop=%d",
+        get_logger(), "RGB config: enable=%s capture=%dx%d@%d publish=%d bitrate=%dkbps gop=%d",
         impl_->rgb.enable ? "true" : "false", impl_->rgb.width, impl_->rgb.height, impl_->rgb.capture_fps,
         impl_->rgb.publish_fps, impl_->rgb.bitrate_kbps, impl_->rgb.gop_size);
     RCLCPP_INFO(
-        get_logger(),
-        "Depth config: enable=%s capture=%dx%d@%d publish=%d bitrate=%dkbps gop=%d vis=[%d,%d]mm",
+        get_logger(), "Depth config: enable=%s capture=%dx%d@%d publish=%d bitrate=%dkbps gop=%d vis=[%d,%d]mm",
         impl_->depth.enable ? "true" : "false", impl_->depth.width, impl_->depth.height, impl_->depth.capture_fps,
         impl_->depth.publish_fps, impl_->depth.bitrate_kbps, impl_->depth.gop_size,
         impl_->depth.visualization_min_mm, impl_->depth.visualization_max_mm);
+    RCLCPP_INFO(
+        get_logger(), "Detector config: enable=%s model_dir=%s input=%d score=%.2f nms=%.2f fps=%d",
+        impl_->detector.enable ? "true" : "false", impl_->detector.model_dir.c_str(), impl_->detector.input_size,
+        impl_->detector.score_threshold, impl_->detector.nms_threshold, impl_->detector.fps);
 }
 
 void LCVision::prepareModel() {
-    RCLCPP_INFO(get_logger(), "Vision recognition pipeline is currently disabled; camera/video framework only.");
+    impl_->detector_ready = false;
+    impl_->detector_runtime_enabled.store(false);
+
+    if (!impl_->detector.enable) {
+        RCLCPP_INFO(get_logger(), "NCNN detector disabled by parameter.");
+        return;
+    }
+
+    if (!impl_->rgb.enable) {
+        RCLCPP_WARN(get_logger(), "NCNN detector requires RGB input; detector disabled because rgb.enable=false.");
+        return;
+    }
+
+    try {
+        const fs::path model_dir = impl_->resolveModelDirectory();
+        if (!fs::exists(model_dir) || !fs::is_directory(model_dir)) {
+            throw std::runtime_error("Model directory does not exist: " + model_dir.string());
+        }
+
+        fs::path model_param;
+        for (const auto &entry : fs::directory_iterator(model_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".param") {
+                model_param = entry.path();
+                break;
+            }
+        }
+        if (model_param.empty()) {
+            throw std::runtime_error("No .param file found in model directory: " + model_dir.string());
+        }
+
+        const fs::path model_bin = model_param.parent_path() / (model_param.stem().string() + ".bin");
+        if (!fs::exists(model_bin)) {
+            throw std::runtime_error("NCNN .bin file not found next to " + model_param.string());
+        }
+
+        const fs::path metadata_path = model_dir / "metadata.yaml";
+        const ParsedMetadata metadata = parseMetadataFile(metadata_path);
+        if (!metadata.class_names.empty()) {
+            impl_->detector.class_names = metadata.class_names;
+        }
+        if (metadata.input_size > 0) {
+            impl_->detector.input_size = metadata.input_size;
+        }
+
+        impl_->updateTargetClassIds();
+
+        impl_->detector_net.clear();
+        impl_->detector_net.opt.use_vulkan_compute = false;
+        impl_->detector_net.opt.num_threads        = std::max(1, std::min(2, static_cast<int>(std::thread::hardware_concurrency())));
+
+        if (impl_->detector_net.load_param(model_param.c_str()) != 0) {
+            throw std::runtime_error("Failed to load NCNN param file: " + model_param.string());
+        }
+        if (impl_->detector_net.load_model(model_bin.c_str()) != 0) {
+            throw std::runtime_error("Failed to load NCNN model weights: " + model_bin.string());
+        }
+
+        const auto input_indexes  = impl_->detector_net.input_indexes();
+        const auto output_indexes = impl_->detector_net.output_indexes();
+        if (input_indexes.empty()) {
+            throw std::runtime_error("NCNN model exposes no input blobs");
+        }
+        if (output_indexes.empty()) {
+            throw std::runtime_error("NCNN model exposes no output blobs");
+        }
+
+        impl_->detector_input_index = input_indexes.front();
+        impl_->detector_output_indexes.assign(output_indexes.begin(), output_indexes.end());
+#if NCNN_STRING
+        const auto input_names  = impl_->detector_net.input_names();
+        const auto output_names = impl_->detector_net.output_names();
+        impl_->detector_input_name = input_names.empty() ? std::string() : std::string(input_names.front());
+        impl_->detector_output_names.clear();
+        impl_->detector_output_names.reserve(output_names.size());
+        for (const char *name : output_names) {
+            impl_->detector_output_names.emplace_back(name);
+        }
+        std::sort(impl_->detector_output_names.begin(), impl_->detector_output_names.end());
+#else
+        impl_->detector_input_name.clear();
+        impl_->detector_output_names.clear();
+#endif
+
+        impl_->detector_ready = true;
+        impl_->detector_runtime_enabled.store(true);
+        const std::string output_desc =
+            !impl_->detector_output_names.empty() ? impl_->detector_output_names.front()
+                                                  : std::to_string(impl_->detector_output_indexes.front());
+        const std::string input_desc =
+            !impl_->detector_input_name.empty() ? impl_->detector_input_name : std::to_string(impl_->detector_input_index);
+        RCLCPP_INFO(
+            get_logger(), "Loaded NCNN detector from %s using input '%s' and output '%s'", model_dir.string().c_str(),
+            input_desc.c_str(), output_desc.c_str());
+    } catch (const std::exception &ex) {
+        RCLCPP_ERROR(get_logger(), "Failed to prepare NCNN detector, overlays disabled: %s", ex.what());
+        impl_->detector_ready = false;
+        impl_->detector_runtime_enabled.store(false);
+    }
 }
 
 void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
