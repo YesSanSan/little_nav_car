@@ -17,8 +17,8 @@
 #include <rclcpp/publisher.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/subscription.hpp>
+#include <sensor_msgs/msg/battery_state.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float64.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
 
@@ -35,17 +35,21 @@ private:
     void joy_thread_func();
     void cmdvel_callback(geometry_msgs::msg::Twist::SharedPtr msg);
     void reopenPort();
+    int  detectBatteryCellCount(float total_voltage) const;
     int  ConfigurePort(int);
 
     std::string device_name_;
     uint32_t    baud_rate_;
     int         serial_driver_;
+    int         battery_cell_count_ = 0;
 
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr                   cmd_vel_sub;
     rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr base_encoder_pub;
+    rclcpp::Publisher<sensor_msgs::msg::BatteryState>::SharedPtr                 battery_state_pub;
 
     geometry_msgs::msg::Twist                      cmd_vel_msg;
     geometry_msgs::msg::TwistWithCovarianceStamped base_encoder_msg;
+    sensor_msgs::msg::BatteryState                 battery_state_msg;
 
     struct JoyMsg {
         float left_x;

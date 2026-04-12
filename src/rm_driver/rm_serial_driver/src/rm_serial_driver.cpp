@@ -1,6 +1,8 @@
 #include "rm_serial_driver/rm_serial_driver.hpp"
 
 #include <SDL2/SDL.h>
+#include <cmath>
+#include <limits>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +33,7 @@ RMSerialDriver::RMSerialDriver(const rclcpp::NodeOptions &options)
 
     // Create Publisher
     base_encoder_pub = this->create_publisher<geometry_msgs::msg::TwistWithCovarianceStamped>("/base/twist0", rclcpp::SensorDataQoS());
+    battery_state_pub = this->create_publisher<sensor_msgs::msg::BatteryState>("/battery_state", rclcpp::SensorDataQoS());
 
     // Create Subscription
     cmd_vel_sub = this->create_subscription<geometry_msgs::msg::Twist>(
@@ -83,6 +86,42 @@ void RMSerialDriver::cmdvel_callback(geometry_msgs::msg::Twist::SharedPtr msg) {
     cmd_vel_msg.linear.x  = msg->linear.x;
     cmd_vel_msg.linear.y  = msg->linear.y;
     cmd_vel_msg.angular.z = msg->angular.z;
+}
+
+int RMSerialDriver::detectBatteryCellCount(float total_voltage) const {
+    constexpr float kMinCellVoltage     = 2.8f;
+    constexpr float kMaxCellVoltage     = 4.35f;
+    constexpr float kNominalCellVoltage = 3.7f;
+    constexpr int   kCandidates[]       = {3, 4, 6};
+
+    if (!std::isfinite(total_voltage) || total_voltage <= 0.0f) {
+        return 0;
+    }
+
+    if (battery_cell_count_ > 0) {
+        const float cell_voltage = total_voltage / static_cast<float>(battery_cell_count_);
+        if (cell_voltage >= kMinCellVoltage && cell_voltage <= kMaxCellVoltage) {
+            return battery_cell_count_;
+        }
+    }
+
+    int   best_cell_count = 0;
+    float best_score      = std::numeric_limits<float>::max();
+
+    for (int cell_count : kCandidates) {
+        const float cell_voltage = total_voltage / static_cast<float>(cell_count);
+        if (cell_voltage < kMinCellVoltage || cell_voltage > kMaxCellVoltage) {
+            continue;
+        }
+
+        const float score = std::fabs(cell_voltage - kNominalCellVoltage);
+        if (score < best_score) {
+            best_score      = score;
+            best_cell_count = cell_count;
+        }
+    }
+
+    return best_cell_count;
 }
 
 void RMSerialDriver::receiveData() {
@@ -158,6 +197,45 @@ void RMSerialDriver::receiveData() {
             base_encoder_msg.twist.covariance[28] = 1e6;  // pitch
 
             base_encoder_pub->publish(base_encoder_msg);
+
+            const int detected_cell_count = detectBatteryCellCount(packet.volt);
+            if (detected_cell_count != battery_cell_count_) {
+                battery_cell_count_ = detected_cell_count;
+                if (battery_cell_count_ > 0) {
+                    RCLCPP_INFO(
+                        get_logger(), "Detected battery pack: %dS, total voltage: %.2f V",
+                        battery_cell_count_, packet.volt);
+                } else {
+                    RCLCPP_WARN(
+                        get_logger(), "Unable to determine battery cell count from %.2f V", packet.volt);
+                }
+            }
+
+            battery_state_msg.header.stamp = base_encoder_msg.header.stamp;
+            battery_state_msg.header.frame_id = "base_link";
+            battery_state_msg.voltage = packet.volt;
+            battery_state_msg.temperature = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.current = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.charge = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.capacity = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.design_capacity = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.percentage = std::numeric_limits<float>::quiet_NaN();
+            battery_state_msg.power_supply_status = sensor_msgs::msg::BatteryState::POWER_SUPPLY_STATUS_UNKNOWN;
+            battery_state_msg.power_supply_health = sensor_msgs::msg::BatteryState::POWER_SUPPLY_HEALTH_UNKNOWN;
+            battery_state_msg.power_supply_technology = sensor_msgs::msg::BatteryState::POWER_SUPPLY_TECHNOLOGY_LIPO;
+            battery_state_msg.present = packet.volt > 0.0f;
+            battery_state_msg.location = "battery_pack";
+            battery_state_msg.serial_number.clear();
+            battery_state_msg.cell_voltage.clear();
+            battery_state_msg.cell_temperature.clear();
+
+            if (battery_cell_count_ > 0) {
+                const float cell_voltage = packet.volt / static_cast<float>(battery_cell_count_);
+                battery_state_msg.cell_voltage.assign(
+                    static_cast<size_t>(battery_cell_count_), cell_voltage);
+            }
+
+            battery_state_pub->publish(battery_state_msg);
 
             size_t next_idx = i + sizeof(ReceivePacket);
             if (data_size > next_idx)

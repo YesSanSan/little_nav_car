@@ -24,6 +24,7 @@ struct ReceivePacket {
     uint8_t  length;
     float    v;     // 线速度
     float    omega; // 角速度
+    float    volt;  // 电压
     uint64_t time;  // 时间戳 (us)
     uint16_t crc16;
 
