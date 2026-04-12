@@ -9,6 +9,11 @@ RECOVERY_WAIT="${RECOVERY_WAIT:-4}"
 COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-180}"
 STATE_DIR="${STATE_DIR:-/run/wifi-watchdog}"
 LAST_RECOVERY_FILE="$STATE_DIR/last_recovery"
+REBOOT_ON_FAILURE="${REBOOT_ON_FAILURE:-0}"
+MAX_FAILED_RECOVERIES="${MAX_FAILED_RECOVERIES:-5}"
+FAILURE_WINDOW_SECONDS="${FAILURE_WINDOW_SECONDS:-300}"
+FAIL_COUNT_FILE="$STATE_DIR/fail_count"
+FAIL_FIRST_TS_FILE="$STATE_DIR/fail_first_ts"
 
 log() {
   logger -t "$LOG_TAG" "$*"
@@ -58,6 +63,29 @@ mark_recovery() {
   date +%s >"$LAST_RECOVERY_FILE"
 }
 
+record_failed_recovery() {
+  mkdir -p "$STATE_DIR"
+  local now first count
+  now="$(date +%s)"
+  first="$(cat "$FAIL_FIRST_TS_FILE" 2>/dev/null || echo 0)"
+  count="$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
+  if [[ "$first" -eq 0 || $((now - first)) -gt "$FAILURE_WINDOW_SECONDS" ]]; then
+    first="$now"
+    count=0
+  fi
+  count=$((count + 1))
+  printf '%s' "$first" >"$FAIL_FIRST_TS_FILE"
+  printf '%s' "$count" >"$FAIL_COUNT_FILE"
+  if [[ "$REBOOT_ON_FAILURE" == "1" && "$count" -ge "$MAX_FAILED_RECOVERIES" ]]; then
+    log "recovery failed $count times in ${FAILURE_WINDOW_SECONDS}s; rebooting"
+    systemctl reboot
+  fi
+}
+
+clear_failed_recovery() {
+  rm -f "$FAIL_COUNT_FILE" "$FAIL_FIRST_TS_FILE"
+}
+
 in_cooldown() {
   [[ -f "$LAST_RECOVERY_FILE" ]] || return 1
   local last now
@@ -76,6 +104,7 @@ recover_driver() {
   sleep "$RECOVERY_WAIT"
   if interface_present; then
     nmcli connection up "$CONNECTION" ifname "$IFACE" >/dev/null 2>&1 || true
+    clear_failed_recovery
   else
     log "interface $IFACE still missing after reload"
     return 1
@@ -101,6 +130,7 @@ if ! interface_present; then
     if ! interface_present; then
       log "second recovery attempt for missing interface $IFACE"
       recover_driver || true
+      record_failed_recovery
     fi
   }
   exit 0
@@ -148,3 +178,4 @@ if [[ "$nm_state" != "100 (connected)" ]]; then
 fi
 
 log "wifi healthy on $IFACE"
+clear_failed_recovery
