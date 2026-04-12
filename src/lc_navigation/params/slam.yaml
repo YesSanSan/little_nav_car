@@ -303,18 +303,14 @@ map_saver:
 
 planner_server:
   ros__parameters:
-    expected_planner_frequency: 30.0
-    use_sim_time: False
-    planner_plugin_ids: ["GridBased"]
+    expected_planner_frequency: 20.0
+    costmap_update_timeout: 1.0
+    planner_plugins: ["GridBased"]
     GridBased:
-      plugin_types: "nav2_theta_star_planner/ThetaStarPlanner"
-      how_many_corners: 8
-      w_euc_cost: 1.0
-      w_traversal_cost: 2.0
-
-planner_server_rclcpp_node:
-  ros__parameters:
-    use_sim_time: False
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      tolerance: 0.5
+      use_astar: false
+      allow_unknown: true
 
 smoother_server:
   ros__parameters:
@@ -354,8 +350,10 @@ smoother_server:
 
 behavior_server:
   ros__parameters:
-    costmap_topic: local_costmap/costmap_raw
-    footprint_topic: local_costmap/published_footprint
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
     cycle_frequency: 10.0
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
@@ -368,20 +366,14 @@ behavior_server:
       plugin: "nav2_behaviors::Wait"
     assisted_teleop:
       plugin: "nav2_behaviors::AssistedTeleop"
+    local_frame: odom
     global_frame: map
     robot_base_frame: base_link
     transform_tolerance: 0.1
-    use_sim_time: False
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.8
-    min_rotational_vel: 0.3
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
     rotational_acc_lim: 3.2
-# param for BackUpTwzFree  global_costmap/get_costmap
-    robot_radius: 0.35
-    max_radius: 3.5
-    service_name: "local_costmap/get_costmap"
-    free_threshold: 3
-    visualization: True
 
 waypoint_follower:
   ros__parameters:
