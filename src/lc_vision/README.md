@@ -1,13 +1,13 @@
 # lc_vision
 
-`lc_vision` now supports Astra RGB/depth capture, Foxglove H.264 debug streams, and optional person detection with `ncnn`.
+`lc_vision` now supports Astra RGB/depth capture, Foxglove H.264 debug streams, and optional person detection with `ncnn`, with automatic Vulkan acceleration fallback to CPU.
 
 ## Install ncnn with vcpkg
 
 ```bash
 git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
 ~/vcpkg/bootstrap-vcpkg.sh
-~/vcpkg/vcpkg install ncnn:arm64-linux
+~/vcpkg/vcpkg install "ncnn[vulkan]:arm64-linux" --recurse
 ```
 
 ## Export YOLO26 to NCNN
@@ -41,11 +41,17 @@ colcon build \
 The detector is configured in `config/vision.yaml`:
 
 - `detector.enable`
+- `detector.backend`
 - `detector.model_dir`
 - `detector.input_size`
 - `detector.score_threshold`
 - `detector.nms_threshold`
 - `detector.fps`
+- `detector.vulkan_device_index`
+- `detector.cpu_num_threads`
+- `detector.log_backend_info`
 - `detector.target_classes`
+
+`detector.backend` accepts `auto`, `vulkan`, or `cpu`. In `auto`, the node tries Vulkan first and falls back to CPU if GPU initialization fails.
 
 When model loading fails, the node continues publishing RGB/depth debug video without detection overlays.

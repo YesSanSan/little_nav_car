@@ -28,6 +28,10 @@ if(NOT ncnn_DIR AND EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/s
   set(ncnn_DIR "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/ncnn")
 endif()
 
+if(EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/glslang/glslang-config.cmake")
+  set(glslang_DIR "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/glslang" CACHE PATH "Path to glslang config" FORCE)
+endif()
+
 find_package(ncnn CONFIG REQUIRED)
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
@@ -80,11 +84,28 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
+install(FILES
+  README.md
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY models/
+  DESTINATION share/${PROJECT_NAME}/models
+  FILES_MATCHING
+  PATTERN ".ultralytics-venv" EXCLUDE
+  PATTERN "__pycache__" EXCLUDE
+  PATTERN "*.pt" EXCLUDE
+  PATTERN "*.py" EXCLUDE
+  PATTERN "*.pyc" EXCLUDE
+    PATTERN "*.param"
+    PATTERN "*.bin"
+    PATTERN "metadata.yaml"
+)
+
 ament_auto_package(
   INSTALL_TO_SHARE
     config
     launch
-    models
     scripts
-    README.md
 )

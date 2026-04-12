@@ -24,9 +24,13 @@
     depth.invalid_as_black: true
 
     detector.enable: true
+    detector.backend: auto
     detector.model_dir: models/yolo26n_ncnn_model
     detector.input_size: 640
     detector.score_threshold: 0.25
     detector.nms_threshold: 0.45
     detector.fps: 5
+    detector.vulkan_device_index: 0
+    detector.cpu_num_threads: 2
+    detector.log_backend_info: true
     detector.target_classes: ["person"]

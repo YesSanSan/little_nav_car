@@ -36,6 +36,7 @@ extern "C" {
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <astra/astra.hpp>
 #include <foxglove_msgs/msg/compressed_video.hpp>
+#include <gpu.h>
 #include <net.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -119,6 +120,14 @@ std::vector<std::string> defaultCocoClassNames() {
         "keyboard",      "cell phone",   "microwave",     "oven",          "toaster",       "sink",
         "refrigerator",  "book",         "clock",         "vase",          "scissors",      "teddy bear",
         "hair drier",    "toothbrush"};
+}
+
+int defaultDetectorThreadCount() {
+    const auto concurrency = std::thread::hardware_concurrency();
+    if (concurrency == 0U) {
+        return 2;
+    }
+    return std::max(1, std::min(2, static_cast<int>(concurrency)));
 }
 
 std::string expandHomeDirectory(const std::string &path) {
@@ -610,11 +619,15 @@ struct LCVision::Impl {
 
     struct DetectorConfig {
         bool                     enable           = true;
+        std::string              backend          = "auto";
         std::string              model_dir;
         int                      input_size       = 640;
         float                    score_threshold  = 0.25f;
         float                    nms_threshold    = 0.45f;
         int                      fps              = 5;
+        int                      vulkan_device_index = 0;
+        int                      cpu_num_threads     = defaultDetectorThreadCount();
+        bool                     log_backend_info    = true;
         std::vector<std::string> target_classes   = {"person"};
         std::vector<std::string> class_names      = defaultCocoClassNames();
         std::set<int>            target_class_ids = {0};
@@ -709,6 +722,101 @@ struct LCVision::Impl {
         if (detector.target_class_ids.empty() && requested.contains("person") && !detector.class_names.empty()) {
             detector.target_class_ids.insert(0);
         }
+    }
+
+    [[nodiscard]] bool prefersVulkan() const {
+        const auto normalized = toLower(detector.backend);
+        return normalized == "auto" || normalized == "vulkan";
+    }
+
+    [[nodiscard]] bool forcesCpuOnly() const {
+        return toLower(detector.backend) == "cpu";
+    }
+
+    [[nodiscard]] bool backendValueIsKnown() const {
+        const auto normalized = toLower(detector.backend);
+        return normalized == "auto" || normalized == "vulkan" || normalized == "cpu";
+    }
+
+    void cleanupGpu() {
+        detector_net.clear();
+#if NCNN_VULKAN
+        if (gpu_instance_created) {
+            ncnn::destroy_gpu_instance();
+            gpu_instance_created = false;
+        }
+#endif
+        using_vulkan_backend = false;
+        active_backend       = "cpu";
+        detected_gpu_count   = 0;
+        active_gpu_index     = -1;
+    }
+
+    void logBackendSelection(const char *message) const {
+        if (!detector.log_backend_info) {
+            return;
+        }
+
+        RCLCPP_INFO(
+            node.get_logger(), "%s backend=%s gpu_count=%d gpu_index=%d cpu_threads=%d", message,
+            active_backend.c_str(), detected_gpu_count, active_gpu_index, detector.cpu_num_threads);
+    }
+
+    void configureDetectorBackend() {
+        detector_net.opt.num_threads        = std::max(1, detector.cpu_num_threads);
+        detector_net.opt.use_vulkan_compute = false;
+        using_vulkan_backend                = false;
+        active_backend                      = "cpu";
+        detected_gpu_count                  = 0;
+        active_gpu_index                    = -1;
+
+        if (!backendValueIsKnown()) {
+            RCLCPP_WARN(
+                node.get_logger(),
+                "Unknown detector.backend value '%s', defaulting to CPU fallback behavior.",
+                detector.backend.c_str());
+        }
+
+        if (forcesCpuOnly()) {
+            logBackendSelection("NCNN detector configured");
+            return;
+        }
+
+#if NCNN_VULKAN
+        if (!prefersVulkan()) {
+            logBackendSelection("NCNN detector configured");
+            return;
+        }
+
+        if (ncnn::create_gpu_instance() != 0) {
+            RCLCPP_WARN(node.get_logger(), "Failed to create NCNN Vulkan instance, falling back to CPU.");
+            logBackendSelection("NCNN detector configured");
+            return;
+        }
+
+        gpu_instance_created = true;
+        detected_gpu_count   = ncnn::get_gpu_count();
+        if (detected_gpu_count <= 0) {
+            RCLCPP_WARN(node.get_logger(), "No Vulkan-capable NCNN GPU found, falling back to CPU.");
+            cleanupGpu();
+            logBackendSelection("NCNN detector configured");
+            return;
+        }
+
+        active_gpu_index = std::clamp(detector.vulkan_device_index, 0, detected_gpu_count - 1);
+        detector_net.opt.use_vulkan_compute = true;
+        detector_net.set_vulkan_device(active_gpu_index);
+        using_vulkan_backend = true;
+        active_backend       = "vulkan";
+        logBackendSelection("NCNN detector configured");
+#else
+        if (prefersVulkan()) {
+            RCLCPP_WARN(
+                node.get_logger(),
+                "This NCNN build does not include Vulkan support, falling back to CPU backend.");
+        }
+        logBackendSelection("NCNN detector configured");
+#endif
     }
 
     void storeColorFrame(const astra::ColorFrame &frame) {
@@ -1155,6 +1263,11 @@ struct LCVision::Impl {
     std::atomic<bool> detector_runtime_enabled{false};
     bool              detector_ready     = false;
     bool              astra_initialized  = false;
+    bool              gpu_instance_created = false;
+    bool              using_vulkan_backend = false;
+    int               detected_gpu_count   = 0;
+    int               active_gpu_index     = -1;
+    std::string       active_backend       = "cpu";
 
     ncnn::Net                detector_net;
     int                      detector_input_index = 0;
@@ -1315,6 +1428,7 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
         }
         impl_->rgb_encoder.reset();
         impl_->depth_encoder.reset();
+        impl_->cleanupGpu();
         if (impl_->astra_initialized) {
             astra::terminate();
             impl_->astra_initialized = false;
@@ -1368,6 +1482,7 @@ LCVision::~LCVision() {
 
     impl_->rgb_encoder.reset();
     impl_->depth_encoder.reset();
+    impl_->cleanupGpu();
     if (impl_->astra_initialized) {
         astra::terminate();
         impl_->astra_initialized = false;
@@ -1401,12 +1516,16 @@ void LCVision::getParams() {
     impl_->depth.invalid_as_black     = this->declare_parameter<bool>("depth.invalid_as_black", true);
 
     impl_->detector.enable = this->declare_parameter<bool>("detector.enable", true);
+    impl_->detector.backend = this->declare_parameter<std::string>("detector.backend", "auto");
     impl_->detector.model_dir =
         this->declare_parameter<std::string>("detector.model_dir", "models/yolo26n_ncnn_model");
     impl_->detector.input_size      = this->declare_parameter<int>("detector.input_size", 640);
     impl_->detector.score_threshold = this->declare_parameter<double>("detector.score_threshold", 0.25);
     impl_->detector.nms_threshold   = this->declare_parameter<double>("detector.nms_threshold", 0.45);
     impl_->detector.fps             = this->declare_parameter<int>("detector.fps", 5);
+    impl_->detector.vulkan_device_index = this->declare_parameter<int>("detector.vulkan_device_index", 0);
+    impl_->detector.cpu_num_threads     = this->declare_parameter<int>("detector.cpu_num_threads", defaultDetectorThreadCount());
+    impl_->detector.log_backend_info    = this->declare_parameter<bool>("detector.log_backend_info", true);
     impl_->detector.target_classes =
         this->declare_parameter<std::vector<std::string>>("detector.target_classes", std::vector<std::string>{"person"});
 
@@ -1420,14 +1539,17 @@ void LCVision::getParams() {
         impl_->depth.publish_fps, impl_->depth.bitrate_kbps, impl_->depth.gop_size,
         impl_->depth.visualization_min_mm, impl_->depth.visualization_max_mm);
     RCLCPP_INFO(
-        get_logger(), "Detector config: enable=%s model_dir=%s input=%d score=%.2f nms=%.2f fps=%d",
-        impl_->detector.enable ? "true" : "false", impl_->detector.model_dir.c_str(), impl_->detector.input_size,
-        impl_->detector.score_threshold, impl_->detector.nms_threshold, impl_->detector.fps);
+        get_logger(),
+        "Detector config: enable=%s backend=%s model_dir=%s input=%d score=%.2f nms=%.2f fps=%d vulkan_device=%d cpu_threads=%d",
+        impl_->detector.enable ? "true" : "false", impl_->detector.backend.c_str(), impl_->detector.model_dir.c_str(),
+        impl_->detector.input_size, impl_->detector.score_threshold, impl_->detector.nms_threshold, impl_->detector.fps,
+        impl_->detector.vulkan_device_index, impl_->detector.cpu_num_threads);
 }
 
 void LCVision::prepareModel() {
     impl_->detector_ready = false;
     impl_->detector_runtime_enabled.store(false);
+    impl_->cleanupGpu();
 
     if (!impl_->detector.enable) {
         RCLCPP_INFO(get_logger(), "NCNN detector disabled by parameter.");
@@ -1473,8 +1595,7 @@ void LCVision::prepareModel() {
         impl_->updateTargetClassIds();
 
         impl_->detector_net.clear();
-        impl_->detector_net.opt.use_vulkan_compute = false;
-        impl_->detector_net.opt.num_threads        = std::max(1, std::min(2, static_cast<int>(std::thread::hardware_concurrency())));
+        impl_->configureDetectorBackend();
 
         if (impl_->detector_net.load_param(model_param.c_str()) != 0) {
             throw std::runtime_error("Failed to load NCNN param file: " + model_param.string());
@@ -1517,12 +1638,13 @@ void LCVision::prepareModel() {
         const std::string input_desc =
             !impl_->detector_input_name.empty() ? impl_->detector_input_name : std::to_string(impl_->detector_input_index);
         RCLCPP_INFO(
-            get_logger(), "Loaded NCNN detector from %s using input '%s' and output '%s'", model_dir.string().c_str(),
-            input_desc.c_str(), output_desc.c_str());
+            get_logger(), "Loaded NCNN detector from %s using input '%s' and output '%s' on backend '%s'",
+            model_dir.string().c_str(), input_desc.c_str(), output_desc.c_str(), impl_->active_backend.c_str());
     } catch (const std::exception &ex) {
         RCLCPP_ERROR(get_logger(), "Failed to prepare NCNN detector, overlays disabled: %s", ex.what());
         impl_->detector_ready = false;
         impl_->detector_runtime_enabled.store(false);
+        impl_->cleanupGpu();
     }
 }
 

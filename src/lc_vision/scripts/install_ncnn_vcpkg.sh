@@ -11,6 +11,6 @@ if [[ ! -x "${VCPKG_DIR}/vcpkg" ]]; then
   "${VCPKG_DIR}/bootstrap-vcpkg.sh"
 fi
 
-"${VCPKG_DIR}/vcpkg" install ncnn:arm64-linux
+"${VCPKG_DIR}/vcpkg" install "ncnn[vulkan]:arm64-linux" --recurse
 
-echo "ncnn installed via vcpkg at ${VCPKG_DIR}"
+echo "ncnn with Vulkan support installed via vcpkg at ${VCPKG_DIR}"
