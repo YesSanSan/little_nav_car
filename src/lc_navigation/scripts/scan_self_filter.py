@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import rclpy
 from rclpy.duration import Duration
@@ -51,6 +51,10 @@ class ScanSelfFilter(Node):
         self.declare_parameter("marker_z", 0.03)
         self.declare_parameter("marker_line_width", 0.01)
         self.declare_parameter("marker_alpha", 0.2)
+        self.declare_parameter("fixed_resolution_enabled", False)
+        self.declare_parameter("fixed_resolution_bins", 460)
+        self.declare_parameter("fixed_resolution_angle_min", 0.0)
+        self.declare_parameter("fixed_resolution_use_full_circle", False)
 
         self.input_scan_topic = self.get_parameter("input_scan_topic").get_parameter_value().string_value
         self.output_scan_topic = self.get_parameter("output_scan_topic").get_parameter_value().string_value
@@ -66,6 +70,19 @@ class ScanSelfFilter(Node):
         self.marker_z = self.get_parameter("marker_z").get_parameter_value().double_value
         self.marker_line_width = self.get_parameter("marker_line_width").get_parameter_value().double_value
         self.marker_alpha = self.get_parameter("marker_alpha").get_parameter_value().double_value
+        self.fixed_resolution_enabled = (
+            self.get_parameter("fixed_resolution_enabled").get_parameter_value().bool_value
+        )
+        self.fixed_resolution_bins = self.get_parameter("fixed_resolution_bins").get_parameter_value().integer_value
+        self.fixed_resolution_angle_min_config = (
+            self.get_parameter("fixed_resolution_angle_min").get_parameter_value().double_value
+        )
+        self.fixed_resolution_use_full_circle = (
+            self.get_parameter("fixed_resolution_use_full_circle").get_parameter_value().bool_value
+        )
+        self.fixed_resolution_angle_min: Optional[float] = None
+        self.fixed_resolution_angle_max: Optional[float] = None
+        self.fixed_resolution_angle_increment: Optional[float] = None
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
@@ -81,48 +98,122 @@ class ScanSelfFilter(Node):
         publish_period = 1.0 / self.marker_publish_rate if self.marker_publish_rate > 0.0 else 0.2
         self.marker_timer = self.create_timer(publish_period, self.publish_filter_markers)
 
-        self._last_tf_warning_time_ns = 0
+        self._last_warning_time_ns_by_key: Dict[str, int] = {}
         self.add_on_set_parameters_callback(self.on_set_parameters)
 
         self.get_logger().info(
             f"Filtering {self.input_scan_topic} -> {self.output_scan_topic} in {self.base_frame} "
-            f"with bounds x:[{self.x_min:.4f}, {self.x_max:.4f}] y:[{self.y_min:.4f}, {self.y_max:.4f}]"
+            f"with bounds x:[{self.x_min:.4f}, {self.x_max:.4f}] y:[{self.y_min:.4f}, {self.y_max:.4f}] "
+            f"(fixed_resolution_enabled={self.fixed_resolution_enabled}, "
+            f"fixed_resolution_bins={self.fixed_resolution_bins}, "
+            f"fixed_resolution_use_full_circle={self.fixed_resolution_use_full_circle})"
         )
 
     def scan_callback(self, msg: LaserScan) -> None:
+        filtered_scan = self.clone_scan(msg)
+
         if not msg.header.frame_id:
-            self.warn_throttled("LaserScan has empty frame_id; bypassing self filter for this frame.")
-            self.publisher.publish(msg)
-            return
+            self.warn_throttled(
+                "LaserScan has empty frame_id; bypassing self filter for this frame.",
+                key="missing_frame_id",
+            )
+        else:
+            transform = self.lookup_transform(msg.header.frame_id)
+            if transform is not None:
+                rotation = quaternion_to_rotation_matrix(
+                    transform.transform.rotation.x,
+                    transform.transform.rotation.y,
+                    transform.transform.rotation.z,
+                    transform.transform.rotation.w,
+                )
+                translation = (
+                    transform.transform.translation.x,
+                    transform.transform.translation.y,
+                    transform.transform.translation.z,
+                )
 
-        transform = self.lookup_transform(msg.header.frame_id)
-        if transform is None:
-            self.publisher.publish(msg)
-            return
+                for index, scan_range in enumerate(msg.ranges):
+                    if not math.isfinite(scan_range):
+                        continue
+                    if scan_range < msg.range_min or scan_range > msg.range_max:
+                        continue
 
-        filtered_scan = LaserScan()
-        filtered_scan.header = msg.header
-        filtered_scan.angle_min = msg.angle_min
-        filtered_scan.angle_max = msg.angle_max
-        filtered_scan.angle_increment = msg.angle_increment
-        filtered_scan.time_increment = msg.time_increment
-        filtered_scan.scan_time = msg.scan_time
-        filtered_scan.range_min = msg.range_min
-        filtered_scan.range_max = msg.range_max
-        filtered_scan.ranges = list(msg.ranges)
-        filtered_scan.intensities = list(msg.intensities)
+                    angle = msg.angle_min + index * msg.angle_increment
+                    point_in_laser = (
+                        scan_range * math.cos(angle),
+                        scan_range * math.sin(angle),
+                        0.0,
+                    )
+                    point_in_base = self.transform_point(rotation, translation, point_in_laser)
 
-        rotation = quaternion_to_rotation_matrix(
-            transform.transform.rotation.x,
-            transform.transform.rotation.y,
-            transform.transform.rotation.z,
-            transform.transform.rotation.w,
-        )
-        translation = (
-            transform.transform.translation.x,
-            transform.transform.translation.y,
-            transform.transform.translation.z,
-        )
+                    if self.is_inside_filter_box(point_in_base[0], point_in_base[1]):
+                        filtered_scan.ranges[index] = float("inf")
+
+        output_scan = filtered_scan
+        if self.fixed_resolution_enabled:
+            output_scan = self.resample_scan_to_fixed_resolution(filtered_scan)
+
+        self.publisher.publish(output_scan)
+        self.publish_filter_markers()
+
+    def clone_scan(self, msg: LaserScan) -> LaserScan:
+        cloned_scan = LaserScan()
+        cloned_scan.header = msg.header
+        cloned_scan.angle_min = msg.angle_min
+        cloned_scan.angle_max = msg.angle_max
+        cloned_scan.angle_increment = msg.angle_increment
+        cloned_scan.time_increment = msg.time_increment
+        cloned_scan.scan_time = msg.scan_time
+        cloned_scan.range_min = msg.range_min
+        cloned_scan.range_max = msg.range_max
+        cloned_scan.ranges = list(msg.ranges)
+        cloned_scan.intensities = list(msg.intensities)
+        return cloned_scan
+
+    def resample_scan_to_fixed_resolution(self, msg: LaserScan) -> LaserScan:
+        if self.fixed_resolution_bins < 2:
+            self.warn_throttled(
+                "fixed_resolution_bins must be at least 2; publishing the filtered scan unchanged.",
+                key="invalid_fixed_resolution_bins",
+            )
+            return msg
+
+        if not self.lock_fixed_resolution_grid(msg):
+            return msg
+
+        angle_min = self.fixed_resolution_angle_min
+        angle_max = self.fixed_resolution_angle_max
+        angle_increment = self.fixed_resolution_angle_increment
+        if angle_min is None or angle_max is None or angle_increment is None:
+            return msg
+
+        if not self.fixed_resolution_use_full_circle and (
+            not math.isclose(msg.angle_min, angle_min, rel_tol=0.0, abs_tol=1e-6)
+            or not math.isclose(msg.angle_max, angle_max, rel_tol=0.0, abs_tol=1e-6)
+        ):
+            self.warn_throttled(
+                "LaserScan angle range changed after fixed-resolution grid was locked; "
+                "continuing to publish on the original fixed grid.",
+                key="fixed_resolution_angle_range_changed",
+            )
+
+        output_scan = LaserScan()
+        output_scan.header = msg.header
+        output_scan.angle_min = angle_min
+        output_scan.angle_max = angle_max
+        output_scan.angle_increment = angle_increment
+        output_scan.time_increment = self.compute_fixed_resolution_time_increment(msg)
+        output_scan.scan_time = msg.scan_time
+        output_scan.range_min = msg.range_min
+        output_scan.range_max = msg.range_max
+        output_scan.ranges = [float("inf")] * self.fixed_resolution_bins
+        output_scan.intensities = [0.0] * self.fixed_resolution_bins
+
+        best_angle_errors = [float("inf")] * self.fixed_resolution_bins
+        best_ranges = [float("inf")] * self.fixed_resolution_bins
+        input_intensities = list(msg.intensities)
+        intensity_count = len(input_intensities)
+        tie_tolerance = 1e-12
 
         for index, scan_range in enumerate(msg.ranges):
             if not math.isfinite(scan_range):
@@ -131,18 +222,72 @@ class ScanSelfFilter(Node):
                 continue
 
             angle = msg.angle_min + index * msg.angle_increment
-            point_in_laser = (
-                scan_range * math.cos(angle),
-                scan_range * math.sin(angle),
-                0.0,
+            mapped_index = int(round((angle - angle_min) / angle_increment))
+            if mapped_index < 0 or mapped_index >= self.fixed_resolution_bins:
+                continue
+
+            mapped_angle = angle_min + mapped_index * angle_increment
+            angle_error = abs(angle - mapped_angle)
+            should_replace = angle_error + tie_tolerance < best_angle_errors[mapped_index]
+            should_replace = should_replace or (
+                math.isclose(angle_error, best_angle_errors[mapped_index], rel_tol=0.0, abs_tol=tie_tolerance)
+                and scan_range < best_ranges[mapped_index]
             )
-            point_in_base = self.transform_point(rotation, translation, point_in_laser)
+            if not should_replace:
+                continue
 
-            if self.is_inside_filter_box(point_in_base[0], point_in_base[1]):
-                filtered_scan.ranges[index] = float("inf")
+            output_scan.ranges[mapped_index] = scan_range
+            output_scan.intensities[mapped_index] = (
+                input_intensities[index] if index < intensity_count else 0.0
+            )
+            best_angle_errors[mapped_index] = angle_error
+            best_ranges[mapped_index] = scan_range
 
-        self.publisher.publish(filtered_scan)
-        self.publish_filter_markers()
+        return output_scan
+
+    def lock_fixed_resolution_grid(self, msg: LaserScan) -> bool:
+        if (
+            self.fixed_resolution_angle_min is not None
+            and self.fixed_resolution_angle_max is not None
+            and self.fixed_resolution_angle_increment is not None
+        ):
+            return True
+
+        if self.fixed_resolution_use_full_circle:
+            angle_min = self.fixed_resolution_angle_min_config
+            angle_increment = (2.0 * math.pi) / float(self.fixed_resolution_bins)
+            angle_max = angle_min + angle_increment * float(self.fixed_resolution_bins - 1)
+        else:
+            angle_min = msg.angle_min
+            angle_increment = (msg.angle_max - msg.angle_min) / float(self.fixed_resolution_bins - 1)
+            angle_max = msg.angle_max
+
+        if not math.isfinite(angle_increment) or abs(angle_increment) <= 1e-12:
+            self.warn_throttled(
+                "Unable to lock the fixed-resolution grid because the incoming scan angle range is invalid; "
+                "publishing the filtered scan unchanged.",
+                key="invalid_fixed_resolution_grid",
+            )
+            return False
+
+        self.fixed_resolution_angle_min = angle_min
+        self.fixed_resolution_angle_max = angle_max
+        self.fixed_resolution_angle_increment = angle_increment
+        self.get_logger().info(
+            f"Locked fixed-resolution scan grid to angle_min={self.fixed_resolution_angle_min:.6f}, "
+            f"angle_max={self.fixed_resolution_angle_max:.6f}, bins={self.fixed_resolution_bins}, "
+            f"use_full_circle={self.fixed_resolution_use_full_circle}"
+        )
+        return True
+
+    def compute_fixed_resolution_time_increment(self, msg: LaserScan) -> float:
+        if msg.scan_time > 0.0:
+            return msg.scan_time / float(self.fixed_resolution_bins)
+
+        if msg.time_increment > 0.0 and len(msg.ranges) > 0:
+            return msg.time_increment * float(len(msg.ranges)) / float(self.fixed_resolution_bins)
+
+        return 0.0
 
     def lookup_transform(self, scan_frame: str):
         try:
@@ -175,6 +320,13 @@ class ScanSelfFilter(Node):
 
     def on_set_parameters(self, parameters: List) -> SetParametersResult:
         for parameter in parameters:
+            if parameter.name == "fixed_resolution_bins" and int(parameter.value) < 2:
+                return SetParametersResult(
+                    successful=False,
+                    reason="fixed_resolution_bins must be at least 2",
+                )
+
+        for parameter in parameters:
             if parameter.name == "base_frame":
                 self.base_frame = parameter.value
             elif parameter.name == "x_min":
@@ -193,9 +345,26 @@ class ScanSelfFilter(Node):
                 self.marker_line_width = float(parameter.value)
             elif parameter.name == "marker_alpha":
                 self.marker_alpha = float(parameter.value)
+            elif parameter.name == "fixed_resolution_enabled":
+                self.fixed_resolution_enabled = bool(parameter.value)
+                self.reset_fixed_resolution_grid()
+            elif parameter.name == "fixed_resolution_bins":
+                self.fixed_resolution_bins = int(parameter.value)
+                self.reset_fixed_resolution_grid()
+            elif parameter.name == "fixed_resolution_angle_min":
+                self.fixed_resolution_angle_min_config = float(parameter.value)
+                self.reset_fixed_resolution_grid()
+            elif parameter.name == "fixed_resolution_use_full_circle":
+                self.fixed_resolution_use_full_circle = bool(parameter.value)
+                self.reset_fixed_resolution_grid()
 
         self.publish_filter_markers()
         return SetParametersResult(successful=True)
+
+    def reset_fixed_resolution_grid(self) -> None:
+        self.fixed_resolution_angle_min = None
+        self.fixed_resolution_angle_max = None
+        self.fixed_resolution_angle_increment = None
 
     def publish_filter_markers(self) -> None:
         now = self.get_clock().now().to_msg()
@@ -252,11 +421,13 @@ class ScanSelfFilter(Node):
         point.z = self.marker_z
         return point
 
-    def warn_throttled(self, message: str, throttle_sec: float = 5.0) -> None:
+    def warn_throttled(self, message: str, throttle_sec: float = 5.0, key: Optional[str] = None) -> None:
         now_ns = self.get_clock().now().nanoseconds
-        if now_ns - self._last_tf_warning_time_ns >= int(throttle_sec * 1e9):
+        warning_key = key if key is not None else message
+        last_warning_time_ns = self._last_warning_time_ns_by_key.get(warning_key, 0)
+        if now_ns - last_warning_time_ns >= int(throttle_sec * 1e9):
             self.get_logger().warning(message)
-            self._last_tf_warning_time_ns = now_ns
+            self._last_warning_time_ns_by_key[warning_key] = now_ns
 
 
 def main(args: Optional[list] = None) -> None:

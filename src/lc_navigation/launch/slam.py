@@ -183,7 +183,15 @@ def generate_launch_description():
                 executable='scan_self_filter.py',
                 name='scan_self_filter',
                 output='screen',
-                parameters=[self_filter_params_file],
+                parameters=[
+                    self_filter_params_file,
+                    {
+                        'fixed_resolution_enabled': True,
+                        'fixed_resolution_bins': 460,
+                        'fixed_resolution_angle_min': 0.0,
+                        'fixed_resolution_use_full_circle': True,
+                    },
+                ],
             ),
             # Node(
             #     package="fake_localization_ros2",
