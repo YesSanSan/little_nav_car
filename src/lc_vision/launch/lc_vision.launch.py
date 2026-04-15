@@ -10,9 +10,11 @@ from launch_ros.actions import Node
 def generate_launch_description():
     package_share = get_package_share_directory("lc_vision")
 
-    default_sdk_root = os.path.expanduser(
-        "~/AstraSDK-v2.1.3-Linux-arm/AstraSDK-v2.1.3-94bca0f52e-20210611T023312Z-Linux-aarch64"
+    default_sdk_root = os.environ.get(
+        "ASTRA_SDK_ROOT",
+        "/home/cmls/sanwu/AstraSDK-v2.1.3-Ubuntu-x86_64/AstraSDK-v2.1.3-94bca0f52e-20210608T062039Z-Ubuntu18.04-x86_64",
     )
+    default_sdk_root = os.path.expanduser(default_sdk_root)
     default_params_file = os.path.join(package_share, "config", "vision.yaml")
 
     sdk_root = LaunchConfiguration("sdk_root")

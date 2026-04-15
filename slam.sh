@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-WORKSPACE_DIR="/home/betty/help_ws/little_nav_car"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="${SCRIPT_DIR}"
 USE_LC_VISION="true"
 STACK_MODE_ARG="--detach"
 

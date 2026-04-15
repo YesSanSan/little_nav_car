@@ -9,8 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(
   DEFAULT_ASTRA_SDK_ROOT
-  "/home/betty/AstraSDK-v2.1.3-Linux-arm/AstraSDK-v2.1.3-94bca0f52e-20210611T023312Z-Linux-aarch64"
+  "/home/cmls/sanwu/AstraSDK-v2.1.3-Ubuntu-x86_64/AstraSDK-v2.1.3-94bca0f52e-20210608T062039Z-Ubuntu18.04-x86_64"
 )
+if(DEFINED ENV{ASTRA_SDK_ROOT} AND NOT "$ENV{ASTRA_SDK_ROOT}" STREQUAL "")
+  set(DEFAULT_ASTRA_SDK_ROOT "$ENV{ASTRA_SDK_ROOT}")
+endif()
 set(ASTRA_SDK_ROOT "${DEFAULT_ASTRA_SDK_ROOT}" CACHE PATH "Path to the Astra SDK root")
 
 find_package(ament_cmake_auto REQUIRED)
@@ -21,7 +24,11 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 find_package(PkgConfig REQUIRED)
 
 if(NOT DEFINED VCPKG_TARGET_TRIPLET)
-  set(VCPKG_TARGET_TRIPLET "arm64-linux")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64)$")
+    set(VCPKG_TARGET_TRIPLET "x64-linux")
+  else()
+    set(VCPKG_TARGET_TRIPLET "arm64-linux")
+  endif()
 endif()
 
 if(NOT ncnn_DIR AND EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/ncnn/ncnnConfig.cmake")
@@ -32,7 +39,14 @@ if(EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/glslang/glsl
   set(glslang_DIR "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/glslang" CACHE PATH "Path to glslang config" FORCE)
 endif()
 
-find_package(ncnn CONFIG REQUIRED)
+find_package(ncnn CONFIG QUIET)
+set(LC_VISION_HAVE_NCNN OFF)
+if(ncnn_FOUND)
+  set(LC_VISION_HAVE_NCNN ON)
+  message(STATUS "Building lc_vision with NCNN detector support")
+else()
+  message(WARNING "NCNN was not found; lc_vision will build without detector support")
+endif()
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
 
@@ -61,8 +75,16 @@ target_link_libraries(${PROJECT_NAME}
   ${ASTRA_CORE_API_LIBRARY}
   PkgConfig::FFMPEG
   ${OpenCV_LIBRARIES}
-  ncnn
   pthread
+)
+
+if(LC_VISION_HAVE_NCNN)
+  target_link_libraries(${PROJECT_NAME} ncnn)
+endif()
+
+target_compile_definitions(${PROJECT_NAME}
+  PRIVATE
+    LC_VISION_HAVE_NCNN=$<IF:$<BOOL:${LC_VISION_HAVE_NCNN}>,1,0>
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

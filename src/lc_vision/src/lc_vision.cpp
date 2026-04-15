@@ -36,8 +36,10 @@ extern "C" {
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <astra/astra.hpp>
 #include <foxglove_msgs/msg/compressed_video.hpp>
+#if LC_VISION_HAVE_NCNN
 #include <gpu.h>
 #include <net.h>
+#endif
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <rclcpp/logging.hpp>
@@ -120,6 +122,14 @@ std::vector<std::string> defaultCocoClassNames() {
         "keyboard",      "cell phone",   "microwave",     "oven",          "toaster",       "sink",
         "refrigerator",  "book",         "clock",         "vase",          "scissors",      "teddy bear",
         "hair drier",    "toothbrush"};
+}
+
+std::string defaultAstraSdkRoot() {
+    if (const char *env_value = std::getenv("ASTRA_SDK_ROOT"); env_value != nullptr && env_value[0] != '\0') {
+        return std::string(env_value);
+    }
+    return "/home/cmls/sanwu/AstraSDK-v2.1.3-Ubuntu-x86_64/"
+           "AstraSDK-v2.1.3-94bca0f52e-20210608T062039Z-Ubuntu18.04-x86_64";
 }
 
 int defaultDetectorThreadCount() {
@@ -739,12 +749,16 @@ struct LCVision::Impl {
     }
 
     void cleanupGpu() {
+#if LC_VISION_HAVE_NCNN
         detector_net.clear();
 #if NCNN_VULKAN
         if (gpu_instance_created) {
             ncnn::destroy_gpu_instance();
             gpu_instance_created = false;
         }
+#endif
+#else
+        gpu_instance_created = false;
 #endif
         using_vulkan_backend = false;
         active_backend       = "cpu";
@@ -763,6 +777,12 @@ struct LCVision::Impl {
     }
 
     void configureDetectorBackend() {
+#if !LC_VISION_HAVE_NCNN
+        detector_runtime_enabled.store(false);
+        detector_ready = false;
+        active_backend = "disabled";
+        return;
+#else
         detector_net.opt.num_threads        = std::max(1, detector.cpu_num_threads);
         detector_net.opt.use_vulkan_compute = false;
         using_vulkan_backend                = false;
@@ -816,6 +836,7 @@ struct LCVision::Impl {
                 "This NCNN build does not include Vulkan support, falling back to CPU backend.");
         }
         logBackendSelection("NCNN detector configured");
+#endif
 #endif
     }
 
@@ -883,6 +904,13 @@ struct LCVision::Impl {
 
     std::vector<Detection> runDetection(
         const std::vector<uint8_t> &rgb_data, const int width, const int height, const int input_size) {
+#if !LC_VISION_HAVE_NCNN
+        (void)rgb_data;
+        (void)width;
+        (void)height;
+        (void)input_size;
+        return {};
+#else
         if (!detector_ready || rgb_data.empty() || width <= 0 || height <= 0) {
             return {};
         }
@@ -1057,6 +1085,7 @@ struct LCVision::Impl {
 
         applyNms(detections, detector.nms_threshold);
         return detections;
+#endif
     }
 
     void detectionLoop() {
@@ -1269,11 +1298,13 @@ struct LCVision::Impl {
     int               active_gpu_index     = -1;
     std::string       active_backend       = "cpu";
 
+#if LC_VISION_HAVE_NCNN
     ncnn::Net                detector_net;
     int                      detector_input_index = 0;
     std::string              detector_input_name;
     std::vector<int>         detector_output_indexes;
     std::vector<std::string> detector_output_names;
+#endif
 
     int64_t last_rgb_frame_index             = -1;
     int64_t last_depth_frame_index           = -1;
@@ -1491,8 +1522,7 @@ LCVision::~LCVision() {
 
 void LCVision::getParams() {
     impl_->sdk_root = expandHomeDirectory(this->declare_parameter<std::string>(
-        "sdk_root",
-        "/home/betty/AstraSDK-v2.1.3-Linux-arm/AstraSDK-v2.1.3-94bca0f52e-20210611T023312Z-Linux-aarch64"));
+        "sdk_root", defaultAstraSdkRoot()));
 
     impl_->rgb.enable       = this->declare_parameter<bool>("rgb.enable", true);
     impl_->rgb.width        = this->declare_parameter<int>("rgb.width", 640);
@@ -1551,6 +1581,12 @@ void LCVision::prepareModel() {
     impl_->detector_runtime_enabled.store(false);
     impl_->cleanupGpu();
 
+#if !LC_VISION_HAVE_NCNN
+    if (impl_->detector.enable) {
+        RCLCPP_WARN(get_logger(), "NCNN was not found at build time; detector overlays are disabled.");
+    }
+    return;
+#else
     if (!impl_->detector.enable) {
         RCLCPP_INFO(get_logger(), "NCNN detector disabled by parameter.");
         return;
@@ -1646,6 +1682,7 @@ void LCVision::prepareModel() {
         impl_->detector_runtime_enabled.store(false);
         impl_->cleanupGpu();
     }
+#endif
 }
 
 void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
