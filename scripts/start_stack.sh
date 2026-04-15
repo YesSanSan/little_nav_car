@@ -109,7 +109,7 @@ build_window_command() {
   fi
 
   printf -v env_setup_cmd '%s' \
-    'unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH LD_LIBRARY_PATH PYTHONPATH ROS_PACKAGE_PATH ROS_DISTRO ROS_VERSION ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION && source /opt/ros/jazzy/setup.bash && source install/setup.bash && '
+    'unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH LD_LIBRARY_PATH PYTHONPATH ROS_PACKAGE_PATH ROS_DISTRO ROS_VERSION ROS_LOCALHOST_ONLY RMW_IMPLEMENTATION && source /opt/ros/jazzy/setup.bash && if [ -n "${OPENVINO_ROOT:-}" ] && [ -f "${OPENVINO_ROOT}/setupvars.sh" ]; then source "${OPENVINO_ROOT}/setupvars.sh"; elif [ -f "$HOME/intel/openvino_2026/setupvars.sh" ]; then source "$HOME/intel/openvino_2026/setupvars.sh"; fi && source install/setup.bash && '
 
   pre_cmd="${env_setup_cmd}${delay_cmd}"
   if [[ "${task_name}" == "localization" ]]; then

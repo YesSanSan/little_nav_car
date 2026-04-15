@@ -23,6 +23,16 @@ find_package(ament_index_cpp REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
 find_package(PkgConfig REQUIRED)
 
+set(DEFAULT_OPENVINO_ROOT "$ENV{HOME}/intel/openvino_2026")
+if(DEFINED ENV{OPENVINO_ROOT} AND NOT "$ENV{OPENVINO_ROOT}" STREQUAL "")
+  set(DEFAULT_OPENVINO_ROOT "$ENV{OPENVINO_ROOT}")
+endif()
+set(OPENVINO_ROOT "${DEFAULT_OPENVINO_ROOT}" CACHE PATH "Path to the OpenVINO installation root")
+
+if(NOT OpenVINO_DIR AND EXISTS "${OPENVINO_ROOT}/runtime/cmake/OpenVINOConfig.cmake")
+  set(OpenVINO_DIR "${OPENVINO_ROOT}/runtime/cmake")
+endif()
+
 if(NOT DEFINED VCPKG_TARGET_TRIPLET)
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64)$")
     set(VCPKG_TARGET_TRIPLET "x64-linux")
@@ -40,12 +50,34 @@ if(EXISTS "$ENV{HOME}/vcpkg/installed/${VCPKG_TARGET_TRIPLET}/share/glslang/glsl
 endif()
 
 find_package(ncnn CONFIG QUIET)
+find_package(OpenVINO QUIET)
+
 set(LC_VISION_HAVE_NCNN OFF)
 if(ncnn_FOUND)
   set(LC_VISION_HAVE_NCNN ON)
-  message(STATUS "Building lc_vision with NCNN detector support")
-else()
-  message(WARNING "NCNN was not found; lc_vision will build without detector support")
+endif()
+
+set(LC_VISION_HAVE_OPENVINO OFF)
+if(OpenVINO_FOUND)
+  set(LC_VISION_HAVE_OPENVINO ON)
+endif()
+
+set(LC_VISION_DETECTOR_FRAMEWORK "none")
+if(LC_VISION_HAVE_OPENVINO)
+  set(LC_VISION_DETECTOR_FRAMEWORK "openvino")
+elseif(LC_VISION_HAVE_NCNN)
+  set(LC_VISION_DETECTOR_FRAMEWORK "ncnn")
+endif()
+
+message(STATUS "lc_vision detector framework selection: ${LC_VISION_DETECTOR_FRAMEWORK}")
+if(LC_VISION_HAVE_OPENVINO)
+  message(STATUS "OpenVINO detected at ${OPENVINO_ROOT}")
+endif()
+if(LC_VISION_HAVE_NCNN)
+  message(STATUS "NCNN detected via CMake package")
+endif()
+if(NOT LC_VISION_HAVE_OPENVINO AND NOT LC_VISION_HAVE_NCNN)
+  message(WARNING "Neither OpenVINO nor NCNN was found; lc_vision will build without detector support")
 endif()
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
@@ -78,18 +110,23 @@ target_link_libraries(${PROJECT_NAME}
   pthread
 )
 
-if(LC_VISION_HAVE_NCNN)
+if(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "openvino")
+  target_link_libraries(${PROJECT_NAME} openvino::runtime)
+elseif(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "ncnn")
   target_link_libraries(${PROJECT_NAME} ncnn)
 endif()
 
 target_compile_definitions(${PROJECT_NAME}
   PRIVATE
     LC_VISION_HAVE_NCNN=$<IF:$<BOOL:${LC_VISION_HAVE_NCNN}>,1,0>
+    LC_VISION_HAVE_OPENVINO=$<IF:$<BOOL:${LC_VISION_HAVE_OPENVINO}>,1,0>
+    LC_VISION_DETECTOR_FRAMEWORK_NCNN=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},ncnn>,1,0>
+    LC_VISION_DETECTOR_FRAMEWORK_OPENVINO=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},openvino>,1,0>
 )
 
 set_target_properties(${PROJECT_NAME} PROPERTIES
-  BUILD_RPATH "${ASTRA_SDK_ROOT}/lib"
-  INSTALL_RPATH "${ASTRA_SDK_ROOT}/lib"
+  BUILD_RPATH "${ASTRA_SDK_ROOT}/lib;${OPENVINO_ROOT}/runtime/lib/intel64"
+  INSTALL_RPATH "${ASTRA_SDK_ROOT}/lib;${OPENVINO_ROOT}/runtime/lib/intel64"
 )
 
 rclcpp_components_register_node(${PROJECT_NAME}
@@ -119,9 +156,11 @@ install(
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pt" EXCLUDE
   PATTERN "*.py" EXCLUDE
-  PATTERN "*.pyc" EXCLUDE
+    PATTERN "*.pyc" EXCLUDE
+    PATTERN "*.xml"
     PATTERN "*.param"
     PATTERN "*.bin"
+    PATTERN "*.mapping"
     PATTERN "metadata.yaml"
 )
 

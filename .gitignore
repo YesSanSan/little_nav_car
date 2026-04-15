@@ -8,3 +8,4 @@ runtime_logs/
 src/lc_navigation/map/*
 src/lc_vision/models/*
 !src/lc_vision/models/.gitkeep
+.venv-models

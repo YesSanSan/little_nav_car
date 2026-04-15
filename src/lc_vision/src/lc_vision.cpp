@@ -36,7 +36,9 @@ extern "C" {
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <astra/astra.hpp>
 #include <foxglove_msgs/msg/compressed_video.hpp>
-#if LC_VISION_HAVE_NCNN
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+#include <openvino/openvino.hpp>
+#elif LC_VISION_DETECTOR_FRAMEWORK_NCNN
 #include <gpu.h>
 #include <net.h>
 #endif
@@ -130,6 +132,14 @@ std::string defaultAstraSdkRoot() {
     }
     return "/home/cmls/sanwu/AstraSDK-v2.1.3-Ubuntu-x86_64/"
            "AstraSDK-v2.1.3-94bca0f52e-20210608T062039Z-Ubuntu18.04-x86_64";
+}
+
+std::string defaultDetectorModelDir() {
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+    return "models/yolo26n_openvino_model";
+#else
+    return "models/yolo26n_ncnn_model";
+#endif
 }
 
 int defaultDetectorThreadCount() {
@@ -381,6 +391,66 @@ void drawDetections(cv::Mat &image, const std::vector<Detection> &detections, co
             image, caption, cv::Point(text_x + 4, text_y - 4), cv::FONT_HERSHEY_SIMPLEX, font_scale,
             cv::Scalar(255, 255, 255), font_thickness, cv::LINE_AA);
     }
+}
+
+template<typename ValueAt>
+std::vector<Detection> decodeDetections(
+    const int width, const int height, const int pad_left, const int pad_top, const float scale,
+    const std::vector<std::string> &class_names, const std::set<int> &target_class_ids, const float score_threshold,
+    const float nms_threshold, const int num_boxes, const ValueAt &value_at) {
+    const int   class_count = std::max(1, static_cast<int>(class_names.size()));
+    const float inv_scale   = 1.0f / std::max(scale, 1e-6f);
+
+    std::vector<Detection> detections;
+    detections.reserve(static_cast<size_t>(num_boxes / 8 + 1));
+
+    for (int box_index = 0; box_index < num_boxes; ++box_index) {
+        int   best_class = -1;
+        float best_score = 0.0f;
+
+        for (int class_index = 0; class_index < class_count; ++class_index) {
+            if (!target_class_ids.empty() && !target_class_ids.contains(class_index)) {
+                continue;
+            }
+
+            const float score = value_at(class_index + 4, box_index);
+            if (score > best_score) {
+                best_score = score;
+                best_class = class_index;
+            }
+        }
+
+        if (best_class < 0 || best_score < score_threshold) {
+            continue;
+        }
+
+        const float center_x = value_at(0, box_index);
+        const float center_y = value_at(1, box_index);
+        const float box_w    = value_at(2, box_index);
+        const float box_h    = value_at(3, box_index);
+
+        const float left   = ((center_x - box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
+        const float top    = ((center_y - box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
+        const float right  = ((center_x + box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
+        const float bottom = ((center_y + box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
+
+        const int x1 = std::clamp(static_cast<int>(std::floor(left)), 0, width - 1);
+        const int y1 = std::clamp(static_cast<int>(std::floor(top)), 0, height - 1);
+        const int x2 = std::clamp(static_cast<int>(std::ceil(right)), x1 + 1, width);
+        const int y2 = std::clamp(static_cast<int>(std::ceil(bottom)), y1 + 1, height);
+
+        Detection detection;
+        detection.box      = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+        detection.score    = best_score;
+        detection.class_id = best_class;
+        detection.label    = best_class < static_cast<int>(class_names.size())
+                                 ? class_names[static_cast<size_t>(best_class)]
+                                 : std::to_string(best_class);
+        detections.push_back(std::move(detection));
+    }
+
+    applyNms(detections, nms_threshold);
+    return detections;
 }
 
 class VideoEncoder {
@@ -692,15 +762,36 @@ struct LCVision::Impl {
     }
 
     fs::path resolveModelDirectory() const {
-        fs::path model_path = fs::path(expandHomeDirectory(detector.model_dir));
-        if (model_path.is_absolute()) {
+        std::string configured_model_dir = detector.model_dir.empty() ? defaultDetectorModelDir() : detector.model_dir;
+        fs::path    model_path           = fs::path(expandHomeDirectory(configured_model_dir));
+
+        const auto matches_current_framework = [](const fs::path &dir) {
+            if (!fs::exists(dir) || !fs::is_directory(dir)) {
+                return false;
+            }
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+            constexpr const char *required_extension = ".xml";
+#elif LC_VISION_DETECTOR_FRAMEWORK_NCNN
+            constexpr const char *required_extension = ".param";
+#else
+            return true;
+#endif
+            for (const auto &entry : fs::directory_iterator(dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == required_extension) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        if (model_path.is_absolute() && matches_current_framework(model_path)) {
             return model_path;
         }
 
         try {
             const auto package_share = fs::path(ament_index_cpp::get_package_share_directory("lc_vision"));
             const auto installed_path = package_share / model_path;
-            if (fs::exists(installed_path)) {
+            if (matches_current_framework(installed_path)) {
                 return installed_path;
             }
         } catch (...) {
@@ -708,8 +799,26 @@ struct LCVision::Impl {
 
         const fs::path source_package_dir = fs::path(__FILE__).parent_path().parent_path();
         const fs::path source_path        = source_package_dir / model_path;
-        if (fs::exists(source_path)) {
+        if (matches_current_framework(source_path)) {
             return source_path;
+        }
+
+        if (configured_model_dir != defaultDetectorModelDir()) {
+            const fs::path fallback_path = fs::path(defaultDetectorModelDir());
+
+            try {
+                const auto package_share = fs::path(ament_index_cpp::get_package_share_directory("lc_vision"));
+                const auto installed_fallback = package_share / fallback_path;
+                if (fs::exists(installed_fallback)) {
+                    return installed_fallback;
+                }
+            } catch (...) {
+            }
+
+            const fs::path source_fallback = source_package_dir / fallback_path;
+            if (fs::exists(source_fallback)) {
+                return source_fallback;
+            }
         }
 
         return model_path;
@@ -735,8 +844,12 @@ struct LCVision::Impl {
     }
 
     [[nodiscard]] bool prefersVulkan() const {
+#if LC_VISION_DETECTOR_FRAMEWORK_NCNN
         const auto normalized = toLower(detector.backend);
         return normalized == "auto" || normalized == "vulkan";
+#else
+        return false;
+#endif
     }
 
     [[nodiscard]] bool forcesCpuOnly() const {
@@ -745,11 +858,30 @@ struct LCVision::Impl {
 
     [[nodiscard]] bool backendValueIsKnown() const {
         const auto normalized = toLower(detector.backend);
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+        return normalized == "auto" || normalized == "cpu" || normalized == "gpu";
+#else
         return normalized == "auto" || normalized == "vulkan" || normalized == "cpu";
+#endif
+    }
+
+    [[nodiscard]] std::string requestedDetectorDevice() const {
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+        const auto normalized = toLower(detector.backend);
+        if (normalized == "cpu") {
+            return "CPU";
+        }
+        if (normalized == "gpu") {
+            return "GPU";
+        }
+        return "AUTO";
+#else
+        return "CPU";
+#endif
     }
 
     void cleanupGpu() {
-#if LC_VISION_HAVE_NCNN
+#if LC_VISION_DETECTOR_FRAMEWORK_NCNN
         detector_net.clear();
 #if NCNN_VULKAN
         if (gpu_instance_created) {
@@ -757,11 +889,15 @@ struct LCVision::Impl {
             gpu_instance_created = false;
         }
 #endif
+#elif LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+        detector_infer_request = {};
+        detector_compiled_model = {};
+        detector_model.reset();
 #else
         gpu_instance_created = false;
 #endif
         using_vulkan_backend = false;
-        active_backend       = "cpu";
+        active_backend       = "disabled";
         detected_gpu_count   = 0;
         active_gpu_index     = -1;
     }
@@ -777,16 +913,21 @@ struct LCVision::Impl {
     }
 
     void configureDetectorBackend() {
-#if !LC_VISION_HAVE_NCNN
-        detector_runtime_enabled.store(false);
-        detector_ready = false;
-        active_backend = "disabled";
-        return;
-#else
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+        if (!backendValueIsKnown()) {
+            RCLCPP_WARN(
+                node.get_logger(), "Unknown detector.backend value '%s', defaulting to AUTO for OpenVINO.",
+                detector.backend.c_str());
+        }
+
+        detector_device_name = requestedDetectorDevice();
+        active_backend       = "openvino:" + toLower(detector_device_name);
+        logBackendSelection("OpenVINO detector configured");
+#elif LC_VISION_DETECTOR_FRAMEWORK_NCNN
         detector_net.opt.num_threads        = std::max(1, detector.cpu_num_threads);
         detector_net.opt.use_vulkan_compute = false;
         using_vulkan_backend                = false;
-        active_backend                      = "cpu";
+        active_backend                      = "ncnn:cpu";
         detected_gpu_count                  = 0;
         active_gpu_index                    = -1;
 
@@ -819,6 +960,7 @@ struct LCVision::Impl {
         if (detected_gpu_count <= 0) {
             RCLCPP_WARN(node.get_logger(), "No Vulkan-capable NCNN GPU found, falling back to CPU.");
             cleanupGpu();
+            active_backend = "ncnn:cpu";
             logBackendSelection("NCNN detector configured");
             return;
         }
@@ -827,7 +969,7 @@ struct LCVision::Impl {
         detector_net.opt.use_vulkan_compute = true;
         detector_net.set_vulkan_device(active_gpu_index);
         using_vulkan_backend = true;
-        active_backend       = "vulkan";
+        active_backend       = "ncnn:vulkan";
         logBackendSelection("NCNN detector configured");
 #else
         if (prefersVulkan()) {
@@ -837,6 +979,11 @@ struct LCVision::Impl {
         }
         logBackendSelection("NCNN detector configured");
 #endif
+#else
+        detector_runtime_enabled.store(false);
+        detector_ready = false;
+        active_backend = "disabled";
+        return;
 #endif
     }
 
@@ -904,13 +1051,115 @@ struct LCVision::Impl {
 
     std::vector<Detection> runDetection(
         const std::vector<uint8_t> &rgb_data, const int width, const int height, const int input_size) {
-#if !LC_VISION_HAVE_NCNN
-        (void)rgb_data;
-        (void)width;
-        (void)height;
-        (void)input_size;
-        return {};
-#else
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+        if (!detector_ready || rgb_data.empty() || width <= 0 || height <= 0) {
+            return {};
+        }
+
+        cv::Mat rgb(height, width, CV_8UC3, const_cast<uint8_t *>(rgb_data.data()));
+
+        const float scale = std::min(
+            static_cast<float>(input_size) / static_cast<float>(width),
+            static_cast<float>(input_size) / static_cast<float>(height));
+        const int resized_w = std::max(1, static_cast<int>(std::lround(static_cast<float>(width) * scale)));
+        const int resized_h = std::max(1, static_cast<int>(std::lround(static_cast<float>(height) * scale)));
+        const int pad_w     = std::max(0, input_size - resized_w);
+        const int pad_h     = std::max(0, input_size - resized_h);
+        const int pad_left  = pad_w / 2;
+        const int pad_top   = pad_h / 2;
+
+        cv::Mat resized;
+        cv::resize(rgb, resized, cv::Size(resized_w, resized_h), 0.0, 0.0, cv::INTER_LINEAR);
+
+        cv::Mat padded(input_size, input_size, CV_8UC3, cv::Scalar(114, 114, 114));
+        resized.copyTo(padded(cv::Rect(pad_left, pad_top, resized_w, resized_h)));
+
+        ov::Tensor input_tensor(
+            ov::element::f32, ov::Shape{1, 3, static_cast<size_t>(input_size), static_cast<size_t>(input_size)});
+        float       *input_data     = input_tensor.data<float>();
+        const size_t channel_stride = static_cast<size_t>(input_size) * static_cast<size_t>(input_size);
+
+        for (int y = 0; y < input_size; ++y) {
+            const auto *row = padded.ptr<uint8_t>(y);
+            for (int x = 0; x < input_size; ++x) {
+                const size_t index = static_cast<size_t>(y) * static_cast<size_t>(input_size) + static_cast<size_t>(x);
+                const auto  *pixel = row + (static_cast<size_t>(x) * 3U);
+                input_data[index]                  = static_cast<float>(pixel[0]) / 255.0f;
+                input_data[channel_stride + index] = static_cast<float>(pixel[1]) / 255.0f;
+                input_data[channel_stride * 2U + index] = static_cast<float>(pixel[2]) / 255.0f;
+            }
+        }
+
+        detector_infer_request.set_input_tensor(input_tensor);
+        detector_infer_request.infer();
+
+        const ov::Tensor output = detector_infer_request.get_output_tensor(0);
+        auto             shape  = output.get_shape();
+        while (shape.size() > 2 && !shape.empty() && shape.front() == 1U) {
+            shape.erase(shape.begin());
+        }
+
+        const auto type       = output.get_element_type();
+        const float *data_f32 = type == ov::element::f32 ? output.data<const float>() : nullptr;
+        const ov::float16 *data_f16 = type == ov::element::f16 ? output.data<const ov::float16>() : nullptr;
+
+        if (data_f32 == nullptr && data_f16 == nullptr) {
+            throw std::runtime_error("Unsupported OpenVINO output element type: " + type.to_string());
+        }
+
+        if (shape.size() != 2 || static_cast<int>(shape[1]) != 6) {
+            throw std::runtime_error(
+                "Unsupported OpenVINO detection tensor shape for Ultralytics export: rank=" +
+                std::to_string(shape.size()) + (shape.empty() ? std::string() : " first_dim=" + std::to_string(shape[0])));
+        }
+
+        const auto read_at = [&](const int flat_index) -> float {
+            if (data_f32 != nullptr) {
+                return data_f32[flat_index];
+            }
+            return static_cast<float>(data_f16[flat_index]);
+        };
+
+        const int num_boxes = static_cast<int>(shape[0]);
+        const float inv_scale = 1.0f / std::max(scale, 1e-6f);
+        std::vector<Detection> detections;
+        detections.reserve(static_cast<size_t>(num_boxes));
+
+        for (int row = 0; row < num_boxes; ++row) {
+            const int base = row * 6;
+            const float score = read_at(base + 4);
+            if (score < detector.score_threshold) {
+                continue;
+            }
+
+            const int class_id = static_cast<int>(std::lround(read_at(base + 5)));
+            if (!detector.target_class_ids.empty() && !detector.target_class_ids.contains(class_id)) {
+                continue;
+            }
+
+            const float raw_x1 = read_at(base + 0);
+            const float raw_y1 = read_at(base + 1);
+            const float raw_x2 = read_at(base + 2);
+            const float raw_y2 = read_at(base + 3);
+
+            const int x1 = std::clamp(static_cast<int>(std::floor((raw_x1 - static_cast<float>(pad_left)) * inv_scale)), 0, width - 1);
+            const int y1 = std::clamp(static_cast<int>(std::floor((raw_y1 - static_cast<float>(pad_top)) * inv_scale)), 0, height - 1);
+            const int x2 = std::clamp(static_cast<int>(std::ceil((raw_x2 - static_cast<float>(pad_left)) * inv_scale)), x1 + 1, width);
+            const int y2 = std::clamp(static_cast<int>(std::ceil((raw_y2 - static_cast<float>(pad_top)) * inv_scale)), y1 + 1, height);
+
+            Detection detection;
+            detection.box      = cv::Rect(x1, y1, x2 - x1, y2 - y1);
+            detection.score    = score;
+            detection.class_id = class_id;
+            detection.label    = class_id >= 0 && class_id < static_cast<int>(detector.class_names.size())
+                                     ? detector.class_names[static_cast<size_t>(class_id)]
+                                     : std::to_string(class_id);
+            detections.push_back(std::move(detection));
+        }
+
+        applyNms(detections, detector.nms_threshold);
+        return detections;
+#elif LC_VISION_DETECTOR_FRAMEWORK_NCNN
         if (!detector_ready || rgb_data.empty() || width <= 0 || height <= 0) {
             return {};
         }
@@ -962,7 +1211,7 @@ struct LCVision::Impl {
 #if NCNN_STRING
         std::string output_name;
         if (!detector_output_names.empty()) {
-            output_name     = detector_output_names.front();
+            output_name    = detector_output_names.front();
             extract_result = extractor.extract(output_name.c_str(), output);
         } else
 #endif
@@ -975,7 +1224,6 @@ struct LCVision::Impl {
 
         const int class_count = std::max(1, static_cast<int>(detector.class_names.size()));
         const int attr_count  = class_count + 4;
-        const float inv_scale = 1.0f / std::max(scale, 1e-6f);
 
         enum class Layout {
             AttrByBoxes,
@@ -1035,56 +1283,15 @@ struct LCVision::Impl {
             return 0.0f;
         };
 
-        std::vector<Detection> detections;
-        detections.reserve(static_cast<size_t>(num_boxes / 8 + 1));
-
-        for (int box_index = 0; box_index < num_boxes; ++box_index) {
-            int   best_class = -1;
-            float best_score = 0.0f;
-
-            for (int class_index = 0; class_index < class_count; ++class_index) {
-                if (!detector.target_class_ids.empty() && !detector.target_class_ids.contains(class_index)) {
-                    continue;
-                }
-
-                const float score = value_at(class_index + 4, box_index);
-                if (score > best_score) {
-                    best_score = score;
-                    best_class = class_index;
-                }
-            }
-
-            if (best_class < 0 || best_score < detector.score_threshold) {
-                continue;
-            }
-
-            const float center_x = value_at(0, box_index);
-            const float center_y = value_at(1, box_index);
-            const float box_w    = value_at(2, box_index);
-            const float box_h    = value_at(3, box_index);
-
-            const float left   = ((center_x - box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
-            const float top    = ((center_y - box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
-            const float right  = ((center_x + box_w * 0.5f) - static_cast<float>(pad_left)) * inv_scale;
-            const float bottom = ((center_y + box_h * 0.5f) - static_cast<float>(pad_top)) * inv_scale;
-
-            const int x1 = std::clamp(static_cast<int>(std::floor(left)), 0, width - 1);
-            const int y1 = std::clamp(static_cast<int>(std::floor(top)), 0, height - 1);
-            const int x2 = std::clamp(static_cast<int>(std::ceil(right)), x1 + 1, width);
-            const int y2 = std::clamp(static_cast<int>(std::ceil(bottom)), y1 + 1, height);
-
-            Detection detection;
-            detection.box      = cv::Rect(x1, y1, x2 - x1, y2 - y1);
-            detection.score    = best_score;
-            detection.class_id = best_class;
-            detection.label    = best_class < static_cast<int>(detector.class_names.size())
-                                     ? detector.class_names[static_cast<size_t>(best_class)]
-                                     : std::to_string(best_class);
-            detections.push_back(std::move(detection));
-        }
-
-        applyNms(detections, detector.nms_threshold);
-        return detections;
+        return decodeDetections(
+            width, height, pad_left, pad_top, scale, detector.class_names, detector.target_class_ids,
+            detector.score_threshold, detector.nms_threshold, num_boxes, value_at);
+#else
+        (void)rgb_data;
+        (void)width;
+        (void)height;
+        (void)input_size;
+        return {};
 #endif
     }
 
@@ -1123,7 +1330,7 @@ struct LCVision::Impl {
                 updateDetectionCache(std::move(detections), width, height, frame_index, stamp);
             } catch (const std::exception &ex) {
                 detector_runtime_enabled.store(false);
-                RCLCPP_ERROR(node.get_logger(), "NCNN inference failed, detector disabled: %s", ex.what());
+                RCLCPP_ERROR(node.get_logger(), "Detector inference failed, detector disabled: %s", ex.what());
                 updateDetectionCache({}, width, height, frame_index, stamp);
             }
         }
@@ -1296,14 +1503,20 @@ struct LCVision::Impl {
     bool              using_vulkan_backend = false;
     int               detected_gpu_count   = 0;
     int               active_gpu_index     = -1;
-    std::string       active_backend       = "cpu";
+    std::string       active_backend       = "disabled";
 
-#if LC_VISION_HAVE_NCNN
+#if LC_VISION_DETECTOR_FRAMEWORK_NCNN
     ncnn::Net                detector_net;
     int                      detector_input_index = 0;
     std::string              detector_input_name;
     std::vector<int>         detector_output_indexes;
     std::vector<std::string> detector_output_names;
+#elif LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+    ov::Core                  detector_core;
+    std::shared_ptr<ov::Model> detector_model;
+    ov::CompiledModel         detector_compiled_model;
+    ov::InferRequest          detector_infer_request;
+    std::string               detector_device_name = "AUTO";
 #endif
 
     int64_t last_rgb_frame_index             = -1;
@@ -1548,7 +1761,7 @@ void LCVision::getParams() {
     impl_->detector.enable = this->declare_parameter<bool>("detector.enable", true);
     impl_->detector.backend = this->declare_parameter<std::string>("detector.backend", "auto");
     impl_->detector.model_dir =
-        this->declare_parameter<std::string>("detector.model_dir", "models/yolo26n_ncnn_model");
+        this->declare_parameter<std::string>("detector.model_dir", defaultDetectorModelDir());
     impl_->detector.input_size      = this->declare_parameter<int>("detector.input_size", 640);
     impl_->detector.score_threshold = this->declare_parameter<double>("detector.score_threshold", 0.25);
     impl_->detector.nms_threshold   = this->declare_parameter<double>("detector.nms_threshold", 0.45);
@@ -1581,12 +1794,80 @@ void LCVision::prepareModel() {
     impl_->detector_runtime_enabled.store(false);
     impl_->cleanupGpu();
 
-#if !LC_VISION_HAVE_NCNN
-    if (impl_->detector.enable) {
-        RCLCPP_WARN(get_logger(), "NCNN was not found at build time; detector overlays are disabled.");
+#if LC_VISION_DETECTOR_FRAMEWORK_OPENVINO
+    if (!impl_->detector.enable) {
+        RCLCPP_INFO(get_logger(), "OpenVINO detector disabled by parameter.");
+        return;
     }
-    return;
-#else
+
+    if (!impl_->rgb.enable) {
+        RCLCPP_WARN(get_logger(), "OpenVINO detector requires RGB input; detector disabled because rgb.enable=false.");
+        return;
+    }
+
+    try {
+        const fs::path model_dir = impl_->resolveModelDirectory();
+        if (!fs::exists(model_dir) || !fs::is_directory(model_dir)) {
+            throw std::runtime_error("Model directory does not exist: " + model_dir.string());
+        }
+
+        fs::path model_xml;
+        for (const auto &entry : fs::directory_iterator(model_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".xml") {
+                model_xml = entry.path();
+                break;
+            }
+        }
+        if (model_xml.empty()) {
+            throw std::runtime_error("No .xml file found in model directory: " + model_dir.string());
+        }
+
+        const fs::path model_bin = model_xml.parent_path() / (model_xml.stem().string() + ".bin");
+        if (!fs::exists(model_bin)) {
+            throw std::runtime_error("OpenVINO .bin file not found next to " + model_xml.string());
+        }
+
+        const fs::path metadata_path = model_dir / "metadata.yaml";
+        const ParsedMetadata metadata = parseMetadataFile(metadata_path);
+        if (!metadata.class_names.empty()) {
+            impl_->detector.class_names = metadata.class_names;
+        }
+
+        impl_->configureDetectorBackend();
+        impl_->detector_model          = impl_->detector_core.read_model(model_xml.string());
+        impl_->detector_compiled_model = impl_->detector_core.compile_model(impl_->detector_model, impl_->detector_device_name);
+        impl_->detector_infer_request  = impl_->detector_compiled_model.create_infer_request();
+
+        const auto inputs = impl_->detector_compiled_model.inputs();
+        const auto outputs = impl_->detector_compiled_model.outputs();
+        if (inputs.empty()) {
+            throw std::runtime_error("OpenVINO model exposes no input tensors");
+        }
+        if (outputs.empty()) {
+            throw std::runtime_error("OpenVINO model exposes no output tensors");
+        }
+
+        const auto input_shape = inputs.front().get_shape();
+        if (input_shape.size() == 4 && input_shape[2] > 0 && input_shape[3] > 0) {
+            impl_->detector.input_size = static_cast<int>(input_shape[2]);
+        } else if (metadata.input_size > 0) {
+            impl_->detector.input_size = metadata.input_size;
+        }
+
+        impl_->updateTargetClassIds();
+        impl_->detector_ready = true;
+        impl_->detector_runtime_enabled.store(true);
+
+        RCLCPP_INFO(
+            get_logger(), "Loaded OpenVINO detector from %s using device '%s' and input size %d",
+            model_dir.string().c_str(), impl_->detector_device_name.c_str(), impl_->detector.input_size);
+    } catch (const std::exception &ex) {
+        RCLCPP_ERROR(get_logger(), "Failed to prepare OpenVINO detector, overlays disabled: %s", ex.what());
+        impl_->detector_ready = false;
+        impl_->detector_runtime_enabled.store(false);
+        impl_->cleanupGpu();
+    }
+#elif LC_VISION_DETECTOR_FRAMEWORK_NCNN
     if (!impl_->detector.enable) {
         RCLCPP_INFO(get_logger(), "NCNN detector disabled by parameter.");
         return;
@@ -1682,6 +1963,11 @@ void LCVision::prepareModel() {
         impl_->detector_runtime_enabled.store(false);
         impl_->cleanupGpu();
     }
+#else
+    if (impl_->detector.enable) {
+        RCLCPP_WARN(get_logger(), "Neither OpenVINO nor NCNN was found at build time; detector overlays are disabled.");
+    }
+    return;
 #endif
 }
 

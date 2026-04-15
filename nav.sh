@@ -4,8 +4,15 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="${SCRIPT_DIR}"
+DEFAULT_OPENVINO_ROOT="${HOME}/intel/openvino_2026"
+DEFAULT_ASTRA_SDK_ROOT="/home/cmls/sanwu/AstraSDK-v2.1.3-Ubuntu-x86_64/AstraSDK-v2.1.3-94bca0f52e-20210608T062039Z-Ubuntu18.04-x86_64"
 USE_LC_VISION="true"
 STACK_MODE_ARG="--detach"
+
+export STACK_SESSION_NAME="nav"
+export STACK_WORKSPACE_DIR="${WORKSPACE_DIR}"
+export STACK_MODE_LABEL="ROS2 navigation"
+export STACK_ENTRY_SCRIPT_NAME="nav.sh"
 
 usage() {
   cat <<EOF
@@ -27,7 +34,7 @@ while (($# > 0)); do
       ;;
     --help|-h)
       usage
-      exec "${WORKSPACE_DIR}/scripts/start_stack.sh" --help
+      exit 0
       ;;
     *)
       echo "Unknown option: $1" >&2
@@ -37,15 +44,18 @@ while (($# > 0)); do
   esac
 done
 
+if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
+  echo "Missing ${WORKSPACE_DIR}/install/setup.bash. Please build the workspace first with colcon build." >&2
+  exit 1
+fi
+
+export OPENVINO_ROOT="${OPENVINO_ROOT:-${DEFAULT_OPENVINO_ROOT}}"
+export ASTRA_SDK_ROOT="${ASTRA_SDK_ROOT:-${DEFAULT_ASTRA_SDK_ROOT}}"
+
 NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=True"
 if [[ "${USE_LC_VISION}" != "true" ]]; then
   NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=False"
 fi
-
-export STACK_SESSION_NAME="nav"
-export STACK_WORKSPACE_DIR="${WORKSPACE_DIR}"
-export STACK_MODE_LABEL="ROS2 navigation"
-export STACK_ENTRY_SCRIPT_NAME="nav.sh"
 
 export STACK_TASK_NAMES="lidar|yesense|serial|localization|navigation"
 export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch rm_serial_driver serial_driver.launch.py|ros2 launch lc_localization ekf.launch.py|${NAVIGATION_CMD}"

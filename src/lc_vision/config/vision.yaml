@@ -25,7 +25,7 @@
 
     detector.enable: true
     detector.backend: auto
-    detector.model_dir: models/yolo26n_ncnn_model
+    detector.model_dir: models/yolo26n_openvino_model
     detector.input_size: 640
     detector.score_threshold: 0.25
     detector.nms_threshold: 0.45
