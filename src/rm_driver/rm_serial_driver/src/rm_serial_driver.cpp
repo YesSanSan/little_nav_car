@@ -269,14 +269,26 @@ float map(float value, float old_min, float old_max, float new_min, float new_ma
 }
 
 void RMSerialDriver::sendData() {
+    JoyMsg joy_msg;
     while (rclcpp::ok()) {
         try {
             SendPacket packet;
             packet.length = sizeof(packet);
 
-            packet.Vx = -float(cmd_vel_msg.linear.x);
+            packet.Vx = float(cmd_vel_msg.linear.x);
             packet.Vy = float(cmd_vel_msg.linear.y);
             packet.Vw = float(cmd_vel_msg.angular.z);
+
+            {
+                std::lock_guard<std::mutex> locker(joy_mtx);
+                joy_msg = joy_msg_;
+            }
+            if (std::abs(joy_msg.left_x) > 3000 || std::abs(joy_msg.left_y) > 3000 || std::abs(joy_msg.right_x) > 3000) {
+                packet.Vx = map(-joy_msg.left_y, 0, 32678, 0, 0.8);
+                // packet.Vy = map(-joy_msg.left_x, 0, 32678, 0, 1);
+                packet.Vw = map(-joy_msg.right_x, 0, 32678, 0, 2.5);
+            }
+            packet.Vx = -packet.Vx;
 
             CRC::appendCRC16CheckSum(reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
 
@@ -345,7 +357,12 @@ void RMSerialDriver::joy_thread_func() {
             joy_msg.left_y  = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY);
             joy_msg.right_x = SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX);
 
-            joy_msg_ = joy_msg;
+            // std::cout << joy_msg.left_x << " " << joy_msg.left_y << " " << joy_msg.right_x <<std::endl;
+
+            {
+                std::lock_guard<std::mutex> locker(joy_mtx);
+                joy_msg_ = joy_msg;
+            }
         }
 
         SDL_Delay(20);

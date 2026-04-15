@@ -63,6 +63,7 @@ private:
     std::thread joy_thread_;
 
     std::mutex serial_mtx;
+    std::mutex joy_mtx;
 };
 } // namespace rm_serial_driver
 
