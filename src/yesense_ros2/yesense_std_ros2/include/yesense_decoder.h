@@ -19,6 +19,7 @@ public:
     ~yesense_decoder();
 
     int data_proc(unsigned char *data, unsigned int len, yis_out_data_t *result);
+    void reset();
 
 private:
 
@@ -46,4 +47,3 @@ private:
 }
 
 #endif
-

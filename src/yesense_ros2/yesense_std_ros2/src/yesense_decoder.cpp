@@ -11,7 +11,7 @@ namespace yesense{
 
 yesense_decoder::yesense_decoder()
 {
-    memset(decode_data, 0, DATA_BUF_SIZE);
+    reset();
     std_out_decoder = new yis_std_out_decoder();
 
     cmd_info.flg        = 0u;
@@ -22,6 +22,12 @@ yesense_decoder::yesense_decoder()
 yesense_decoder::~yesense_decoder()
 {
 
+}
+
+void yesense_decoder::reset()
+{
+    memset(decode_data, 0, DATA_BUF_SIZE);
+    decode_buf_len = 0u;
 }
 
 int yesense_decoder::data_proc(unsigned char *data, unsigned int len, yis_out_data_t *result)

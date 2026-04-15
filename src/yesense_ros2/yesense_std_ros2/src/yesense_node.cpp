@@ -99,7 +99,18 @@ class YESENSE_Publisher : public rclcpp::Node {
 public:
     YESENSE_Publisher()
         : Node("yesense_publisher") {
+        fd = -1;
         driver_type = serial_drv_unknown;
+        serial_data_seen = false;
+        no_data_warning_logged = false;
+        startup_time = std::chrono::steady_clock::now();
+        last_data_time = startup_time;
+        last_publish_time = startup_time;
+        last_reconnect_attempt = startup_time - std::chrono::seconds(5);
+        reconnect_attempts = 0;
+        no_data_reconnect_timeout = std::chrono::seconds(3);
+        reconnect_retry_interval = std::chrono::seconds(1);
+        decode_stall_timeout = std::chrono::seconds(2);
 
         this->declare_parameter<std::string>("serial_port", "/dev/ttyUSB0");
         this->declare_parameter<int>("baud_rate", 460800);
@@ -153,38 +164,75 @@ public:
         RCLCPP_INFO(this->get_logger(), "driver type int %d\n", driver_type);
 
         // =================================================
+        open_serial_port();
+
+        // =================================================
+        timer_          = this->create_wall_timer(1ms, std::bind(&YESENSE_Publisher::timer_callback, this));
+        timer_msg_rate_ = this->create_wall_timer(1ms, std::bind(&YESENSE_Publisher::callback_msg_rate_calc, this));
+    }
+
+    ~YESENSE_Publisher() {
+        close_serial_port();
+    }
+
+private:
+    bool open_serial_port() {
         if (serial_drv_ros == driver_type) {
             try {
+                if (ser.isOpen()) {
+                    ser.close();
+                }
+
                 ser.setPort(serial_port);
                 ser.setBaudrate(baud_rate);
 
-                // 串口设置
                 serial::Timeout to = serial::Timeout::simpleTimeout(1000);
                 ser.setTimeout(to);
 
                 ser.setStopbits(serial::stopbits_t::stopbits_one);
                 ser.setBytesize(serial::bytesize_t::eightbits);
-                ser.setParity(serial::parity_t::parity_none); // 设置校验位
+                ser.setParity(serial::parity_t::parity_none);
 
-                // 打开
                 ser.open();
                 ser.flushInput();
-            } catch (serial::IOException &e) {
-                RCLCPP_INFO(this->get_logger(), "Unable to open port ");
-                return;
+
+                serial_data_seen = false;
+                no_data_warning_logged = false;
+                startup_time = std::chrono::steady_clock::now();
+                last_data_time = startup_time;
+                last_publish_time = startup_time;
+                decoder.reset();
+                memset(&yis_out, 0, sizeof(yis_out));
+
+                RCLCPP_INFO(this->get_logger(), "open serial port to decode msg!\n");
+                return true;
+            } catch (const std::exception &e) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Unable to open serial port '%s': %s",
+                    serial_port.c_str(),
+                    e.what());
+                return false;
             }
         } else if (serial_drv_linux == driver_type) {
             struct termios oldtio, newtio;
             speed_t        speed = obt_baudrate_from_int_to_linux(baud_rate);
 
-            fd = open(serial_port.c_str(), O_RDWR | O_NONBLOCK | O_NOCTTY | O_NDELAY);
-            if (fd < 0) {
-                RCLCPP_INFO(this->get_logger(), "Unable to open port ");
-
-                exit(0);
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
             }
 
-            // save to oldtio
+            fd = open(serial_port.c_str(), O_RDWR | O_NONBLOCK | O_NOCTTY | O_NDELAY);
+            if (fd < 0) {
+                RCLCPP_ERROR(
+                    this->get_logger(),
+                    "Unable to open serial port '%s': %s",
+                    serial_port.c_str(),
+                    strerror(errno));
+                return false;
+            }
+
             tcgetattr(fd, &oldtio);
             bzero(&newtio, sizeof(newtio));
             newtio.c_cflag = speed | CS8 | CLOCAL | CREAD;
@@ -195,39 +243,115 @@ public:
             tcflush(fd, TCIFLUSH);
             tcsetattr(fd, TCSAFLUSH, &newtio);
             tcgetattr(fd, &oldtio);
+
+            serial_data_seen = false;
+            no_data_warning_logged = false;
+            startup_time = std::chrono::steady_clock::now();
+            last_data_time = startup_time;
+            last_publish_time = startup_time;
+            decoder.reset();
+            memset(&yis_out, 0, sizeof(yis_out));
+
             RCLCPP_INFO(this->get_logger(), "open linux serial\n");
+            RCLCPP_INFO(this->get_logger(), "open serial port to decode msg!\n");
+            return true;
         }
 
-        RCLCPP_INFO(this->get_logger(), "open serial port to decode msg!\n");
-
-        // =================================================
-        timer_          = this->create_wall_timer(1ms, std::bind(&YESENSE_Publisher::timer_callback, this));
-        timer_msg_rate_ = this->create_wall_timer(1ms, std::bind(&YESENSE_Publisher::callback_msg_rate_calc, this));
+        RCLCPP_ERROR(this->get_logger(), "Unknown driver type %d", driver_type);
+        return false;
     }
 
-    ~YESENSE_Publisher() {
+    void close_serial_port() {
         if (serial_drv_ros == driver_type) {
-            ser.close();
+            if (ser.isOpen()) {
+                ser.close();
+            }
         } else if (serial_drv_linux == driver_type) {
-            close(fd);
+            if (fd >= 0) {
+                close(fd);
+                fd = -1;
+            }
         }
     }
 
-private:
+    bool serial_port_ready() const {
+        if (serial_drv_ros == driver_type) {
+            return ser.isOpen();
+        }
+        if (serial_drv_linux == driver_type) {
+            return fd >= 0;
+        }
+        return false;
+    }
+
+    void reconnect_serial_port(const char *reason) {
+        const auto now = std::chrono::steady_clock::now();
+        if ((now - last_reconnect_attempt) < reconnect_retry_interval) {
+            return;
+        }
+
+        last_reconnect_attempt = now;
+        reconnect_attempts++;
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Reconnecting IMU serial port '%s' (attempt %u): %s",
+            serial_port.c_str(),
+            reconnect_attempts,
+            reason);
+        close_serial_port();
+        open_serial_port();
+    }
+
     void timer_callback() {
         size_t bytes_read_r_buffer = 0;
+
+        if (!serial_port_ready()) {
+            reconnect_serial_port("serial port is not open");
+            return;
+        }
 
         if (serial_drv_ros == driver_type) {
             if (ser.isOpen() && ser.available()) {
                 size_t bytes_to_read   = std::min(static_cast<size_t>(ser.available()), sizeof(r_buffer));
-                size_t available_bytes = ser.available();
                 // std::cout << "\033[1m\033[34m" << "wheeltec_tues debug_aaaaaaaa" << "\033[0m"<< std::endl;  // wheeltec_tues debug
                 bytes_read_r_buffer = ser.read(r_buffer, bytes_to_read); // wheeltec_tues
                 // bytes_read_r_buffer = ser.read(r_buffer, ser.available()); //wheeltec_tues debug
             }
         } else if (serial_drv_linux == driver_type) {
-            bytes_read_r_buffer = read(fd, r_buffer, UART_RX_BUF_LEN);
+            ssize_t bytes_read = read(fd, r_buffer, UART_RX_BUF_LEN);
+            if (bytes_read > 0) {
+                bytes_read_r_buffer = static_cast<size_t>(bytes_read);
+            } else {
+                bytes_read_r_buffer = 0;
+            }
         }
+
+        if (bytes_read_r_buffer > 0) {
+            serial_data_seen = true;
+            no_data_warning_logged = false;
+            last_data_time = std::chrono::steady_clock::now();
+        } else if (!serial_data_seen && !no_data_warning_logged) {
+            const auto silent_duration = std::chrono::steady_clock::now() - startup_time;
+            if (silent_duration > no_data_reconnect_timeout) {
+                RCLCPP_WARN(
+                    this->get_logger(),
+                    "Serial port opened but no IMU bytes were received in the first 3 seconds. "
+                    "Please check whether the device is streaming and whether '%s' points to the correct port.",
+                    serial_port.c_str());
+                no_data_warning_logged = true;
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if ((now - last_data_time) > no_data_reconnect_timeout) {
+            reconnect_serial_port("no IMU bytes received for 3 seconds");
+            return;
+        }
+        if (serial_data_seen && (now - last_publish_time) > decode_stall_timeout) {
+            reconnect_serial_port("serial bytes are arriving but no IMU messages were decoded for 2 seconds");
+            return;
+        }
+
         int ret = decoder.data_proc(r_buffer, (unsigned int)bytes_read_r_buffer, &yis_out);
 
         if (analysis_ok == ret) {
@@ -235,6 +359,7 @@ private:
 
                 yis_out.content.valid_flg = 0u;
                 user_info.msg_cnt++;
+                last_publish_time = std::chrono::steady_clock::now();
                 publish_msg(&yis_out);
 
                 // RCLCPP_INFO(this->get_logger(), "msg rate: %d, tid %d, acc: %f, %f, %f gyro: %f, %f, %f, euler: %f, %f, %f!",
@@ -273,6 +398,16 @@ private:
     int         baud_rate;
     std::string frame_id;
     int         driver_type; // 选择使用ROS串口驱动或是linux原生驱动
+    std::chrono::steady_clock::time_point startup_time;
+    std::chrono::steady_clock::time_point last_data_time;
+    std::chrono::steady_clock::time_point last_publish_time;
+    std::chrono::steady_clock::time_point last_reconnect_attempt;
+    bool        serial_data_seen;
+    bool        no_data_warning_logged;
+    unsigned int reconnect_attempts;
+    std::chrono::steady_clock::duration no_data_reconnect_timeout;
+    std::chrono::steady_clock::duration reconnect_retry_interval;
+    std::chrono::steady_clock::duration decode_stall_timeout;
 
     // ===
     yis_out_data_t yis_out;
