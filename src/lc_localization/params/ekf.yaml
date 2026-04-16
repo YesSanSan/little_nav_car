@@ -3,7 +3,7 @@ ekf_filter_node:
     ros__parameters:
         # 滤波器输出位置估计的频率（单位：Hz）。注意：滤波器在至少从一个输入接收到一条消息后才会开始计算。
         # 随后将按照此处指定的频率持续运行，无论是否收到更多测量数据。未指定时默认为 30。
-        frequency: 30.0
+        frequency: 50.0
 
         # 传感器超时时间（单位：秒）。超过此时间未收到传感器数据，则认为传感器超时。
         # 发生超时时，我们将对 EKF 执行预测周期而不进行校正。
@@ -26,7 +26,7 @@ ekf_filter_node:
         transform_timeout: 0.0
 
         # 如果遇到问题，尝试将此设置为 true，然后通过 `echo /diagnostics_agg` 主题查看节点是否对任何设置或数据不满意。
-        print_diagnostics: true
+        print_diagnostics: false
 
         # 调试设置。不适合初学者。会向 debug_out_file 指定的文件输出大量信息。
         # 希望您喜欢矩阵！请注意，将此设置为 true 将对节点的性能产生严重的负面影响。
@@ -157,15 +157,17 @@ ekf_filter_node:
 
         imu0: base/imu0
         # 值的顺序是 x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw, ax, ay, az。
-        # 稳定版配置：仅融合 IMU 的 yaw rate，避免启动阶段稀疏/跳变的绝对姿态与线加速度污染 EKF 初值。
+        # 这里仅融合 IMU 的 yaw rate，线速度交给底盘编码器；
+        # 实测高频线加速度在当前链路里收益不大，反而更容易把 EKF 拖慢。
         imu0_config: [false, false, false,
                       false, false, true,
                       false, false, false,
                       false, false, true,
                       true, false, false]
         imu0_differential: false
-        imu0_queue_size: 20
+        imu0_queue_size: 5
         imu0_frame_id: imu_link
+        imu0_nodelay: true
         # imu0_pose_use_child_frame: true
         # imu0_relative: true
         # imu0_pose_rejection_threshold: 0.8                 # 注意参数名称的差异

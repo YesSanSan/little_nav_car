@@ -20,8 +20,25 @@
     depth.gop_size: 24
     depth.frame_id: cam_link
     depth.visualization_min_mm: 300
-    depth.visualization_max_mm: 5000
+    depth.visualization_max_mm: 10000
+    depth.roi_min_valid_mm: 300
+    depth.roi_max_valid_mm: 5000
     depth.invalid_as_black: true
+    depth.estimation.min_valid_pixels: 50
+    depth.estimation.histogram_bin_size_mm: 50
+    depth.estimation.peak_min_ratio: 0.25
+    depth.estimation.peak_min_count: 5
+    depth.estimation.min_peak_pixels: 20
+    depth.estimation.trim_ratio: 0.1
+    depth.estimation.annotate_depth_on_rgb: true
+    depth.estimation.annotate_depth_on_depth: true
+    depth.debug_marker.enable: true
+    depth.debug_marker.topic: ~/depth_debug_marker
+    depth.debug_marker.frame_id: base_link
+    depth.debug_marker.z: 0.05
+    depth.debug_marker.line_width: 0.02
+    depth.debug_marker.alpha: 0.9
+    depth.debug_marker.use_detection_label_ns: true
 
     detector.enable: true
     detector.backend: auto

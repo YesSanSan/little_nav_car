@@ -18,6 +18,7 @@ set(ASTRA_SDK_ROOT "${DEFAULT_ASTRA_SDK_ROOT}" CACHE PATH "Path to the Astra SDK
 
 find_package(ament_cmake_auto REQUIRED)
 ament_auto_find_build_dependencies()
+find_package(rosidl_default_generators REQUIRED)
 
 find_package(ament_index_cpp REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc)
@@ -82,26 +83,37 @@ endif()
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
 
+option(LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG "Enable depth histogram debug video stream" OFF)
+option(LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG "Enable depth peak mask debug video stream" OFF)
+
 find_library(ASTRA_LIBRARY NAMES astra HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 find_library(ASTRA_CORE_LIBRARY NAMES astra_core HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 find_library(ASTRA_CORE_API_LIBRARY NAMES astra_core_api HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 
-ament_auto_add_library(${PROJECT_NAME} SHARED
+set(LC_VISION_COMPONENT_TARGET ${PROJECT_NAME}_component)
+
+ament_auto_add_library(${LC_VISION_COMPONENT_TARGET} SHARED
   src/lc_vision.cpp
 )
 
-target_include_directories(${PROJECT_NAME}
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/DetectionDepth.msg"
+  "msg/DetectionDepthArray.msg"
+  DEPENDENCIES std_msgs
+)
+
+target_include_directories(${LC_VISION_COMPONENT_TARGET}
   PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${ASTRA_SDK_ROOT}/include
 )
 
-target_link_directories(${PROJECT_NAME}
+target_link_directories(${LC_VISION_COMPONENT_TARGET}
   PRIVATE
     "${ASTRA_SDK_ROOT}/lib"
 )
 
-target_link_libraries(${PROJECT_NAME}
+target_link_libraries(${LC_VISION_COMPONENT_TARGET}
   ${ASTRA_LIBRARY}
   ${ASTRA_CORE_LIBRARY}
   ${ASTRA_CORE_API_LIBRARY}
@@ -111,25 +123,31 @@ target_link_libraries(${PROJECT_NAME}
 )
 
 if(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "openvino")
-  target_link_libraries(${PROJECT_NAME} openvino::runtime)
+  target_link_libraries(${LC_VISION_COMPONENT_TARGET} openvino::runtime)
 elseif(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "ncnn")
-  target_link_libraries(${PROJECT_NAME} ncnn)
+  target_link_libraries(${LC_VISION_COMPONENT_TARGET} ncnn)
 endif()
 
-target_compile_definitions(${PROJECT_NAME}
+target_compile_definitions(${LC_VISION_COMPONENT_TARGET}
   PRIVATE
     LC_VISION_HAVE_NCNN=$<IF:$<BOOL:${LC_VISION_HAVE_NCNN}>,1,0>
     LC_VISION_HAVE_OPENVINO=$<IF:$<BOOL:${LC_VISION_HAVE_OPENVINO}>,1,0>
     LC_VISION_DETECTOR_FRAMEWORK_NCNN=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},ncnn>,1,0>
     LC_VISION_DETECTOR_FRAMEWORK_OPENVINO=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},openvino>,1,0>
+    LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG=$<IF:$<BOOL:${LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG}>,1,0>
+    LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG=$<IF:$<BOOL:${LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG}>,1,0>
 )
 
-set_target_properties(${PROJECT_NAME} PROPERTIES
+rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")
+target_link_libraries(${LC_VISION_COMPONENT_TARGET} ${cpp_typesupport_target})
+add_dependencies(${LC_VISION_COMPONENT_TARGET} ${PROJECT_NAME}__rosidl_generator_cpp)
+
+set_target_properties(${LC_VISION_COMPONENT_TARGET} PROPERTIES
   BUILD_RPATH "${ASTRA_SDK_ROOT}/lib;${OPENVINO_ROOT}/runtime/lib/intel64"
   INSTALL_RPATH "${ASTRA_SDK_ROOT}/lib;${OPENVINO_ROOT}/runtime/lib/intel64"
 )
 
-rclcpp_components_register_node(${PROJECT_NAME}
+rclcpp_components_register_node(${LC_VISION_COMPONENT_TARGET}
   PLUGIN lc_vision::LCVision
   EXECUTABLE ${PROJECT_NAME}_node
 )
@@ -163,6 +181,8 @@ install(
     PATTERN "*.mapping"
     PATTERN "metadata.yaml"
 )
+
+ament_export_dependencies(rosidl_default_runtime)
 
 ament_auto_package(
   INSTALL_TO_SHARE

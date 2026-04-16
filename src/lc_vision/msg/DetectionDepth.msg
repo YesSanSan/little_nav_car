@@ -1,0 +1,14 @@
+std_msgs/Header header
+string label
+int32 class_id
+float32 score
+int32 x
+int32 y
+int32 width
+int32 height
+bool depth_valid
+float32 depth_mm
+float32 peak_min_mm
+float32 peak_max_mm
+uint32 roi_valid_pixel_count
+uint32 peak_pixel_count

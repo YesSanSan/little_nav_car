@@ -55,3 +55,41 @@ The detector is configured in `config/vision.yaml`:
 `detector.backend` accepts `auto`, `vulkan`, or `cpu`. In `auto`, the node tries Vulkan first and falls back to CPU if GPU initialization fails.
 
 When model loading fails, the node continues publishing RGB/depth debug video without detection overlays.
+
+## Detection depth output
+
+`lc_vision` now publishes `~/detections_depth` with per-box depth estimates derived from the depth ROI:
+
+- invalid depths are removed with `depth.roi_min_valid_mm` / `depth.roi_max_valid_mm`
+- valid depths are histogrammed with `depth.estimation.histogram_bin_size_mm`
+- the dominant peak is expanded with `depth.estimation.peak_min_ratio` and `depth.estimation.peak_min_count`
+- the final depth is the trimmed mean of the dominant peak samples using `depth.estimation.trim_ratio`
+
+Useful runtime parameters:
+
+- `depth.estimation.min_valid_pixels`
+- `depth.estimation.min_peak_pixels`
+- `depth.estimation.annotate_depth_on_rgb`
+- `depth.estimation.annotate_depth_on_depth`
+- `depth.debug_marker.enable`
+- `depth.debug_marker.topic`
+- `depth.debug_marker.frame_id`
+
+When `depth.debug_marker.enable=true`, the node publishes a `visualization_msgs/MarkerArray` that draws circles centered at `base_link` with radius equal to the estimated depth in meters.
+
+## Optional debug video streams
+
+Two optional debug streams can be compiled in:
+
+```bash
+colcon build \
+  --packages-select lc_vision \
+  --cmake-args \
+    -DLC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG=ON \
+    -DLC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG=ON
+```
+
+With these options enabled, the node can publish:
+
+- `~/depth_histogram/video`
+- `~/depth_peak_mask/video`
