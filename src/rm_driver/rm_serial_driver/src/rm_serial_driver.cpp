@@ -288,7 +288,6 @@ void RMSerialDriver::sendData() {
                 // packet.Vy = map(-joy_msg.left_x, 0, 32678, 0, 1);
                 packet.Vw = map(-joy_msg.right_x, 0, 32678, 0, 2.5);
             }
-            packet.Vx = -packet.Vx;
 
             CRC::appendCRC16CheckSum(reinterpret_cast<uint8_t *>(&packet), sizeof(packet));
 
