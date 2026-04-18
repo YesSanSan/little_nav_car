@@ -44,6 +44,7 @@
     depth.debug_video.histogram.topic: ~/depth_histogram/video
     depth.debug_video.peak_mask.enable: false
     depth.debug_video.peak_mask.topic: ~/depth_peak_mask/video
+    image.rotation_degrees: 90
 
     detector.enable: true
     detector.framework: auto

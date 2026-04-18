@@ -42,6 +42,44 @@ int parseFirstInteger(const std::string &line) {
     return std::stoi(match.str(1));
 }
 
+int normalizeRotationDegrees(int rotation_degrees) {
+    int normalized = rotation_degrees % 360;
+    if (normalized < 0) {
+        normalized += 360;
+    }
+    return normalized;
+}
+
+int rotationDegreesToQuarterTurns(const int rotation_degrees) {
+    const int normalized = normalizeRotationDegrees(rotation_degrees);
+    if (normalized % 90 != 0) {
+        throw std::runtime_error("image.rotation_degrees must be one of 0, 90, 180, 270");
+    }
+    return normalized / 90;
+}
+
+cv::Point2f rotatePoint(const cv::Point2f &point, const cv::Size &source_size, const int quarter_turns) {
+    const int normalized_turns = ((quarter_turns % 4) + 4) % 4;
+    switch (normalized_turns) {
+    case 0:
+        return point;
+    case 1:
+        return cv::Point2f(
+            static_cast<float>(source_size.height) - 1.0f - point.y,
+            point.x);
+    case 2:
+        return cv::Point2f(
+            static_cast<float>(source_size.width) - 1.0f - point.x,
+            static_cast<float>(source_size.height) - 1.0f - point.y);
+    case 3:
+        return cv::Point2f(
+            point.y,
+            static_cast<float>(source_size.width) - 1.0f - point.x);
+    default:
+        return point;
+    }
+}
+
 std::vector<std::string> defaultCocoClassNames() {
     return {
         "person",        "bicycle",      "car",           "motorcycle",    "airplane",      "bus",
@@ -719,6 +757,64 @@ bool LCVision::Impl::isHistogramDebugVideoEnabled() const {
 
 bool LCVision::Impl::isPeakMaskDebugVideoEnabled() const {
     return depth.debug_video.peak_mask.enable && depth_peak_mask_video_pub != nullptr;
+}
+
+void LCVision::Impl::rotateRgbFrame(std::vector<uint8_t> &rgb_data, int &width, int &height) const {
+    const int quarter_turns = rotationDegreesToQuarterTurns(image.rotation_degrees);
+    if (quarter_turns == 0 || width <= 0 || height <= 0 || rgb_data.empty()) {
+        return;
+    }
+
+    cv::Mat source(height, width, CV_8UC3, rgb_data.data());
+    cv::Mat rotated;
+    switch (quarter_turns) {
+    case 1:
+        cv::rotate(source, rotated, cv::ROTATE_90_CLOCKWISE);
+        break;
+    case 2:
+        cv::rotate(source, rotated, cv::ROTATE_180);
+        break;
+    case 3:
+        cv::rotate(source, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+        break;
+    default:
+        return;
+    }
+
+    width = rotated.cols;
+    height = rotated.rows;
+    rgb_data.assign(
+        rotated.data,
+        rotated.data + static_cast<std::ptrdiff_t>(rotated.total() * rotated.elemSize()));
+}
+
+void LCVision::Impl::rotateDepthFrame(std::vector<int16_t> &depth_data, int &width, int &height) const {
+    const int quarter_turns = rotationDegreesToQuarterTurns(image.rotation_degrees);
+    if (quarter_turns == 0 || width <= 0 || height <= 0 || depth_data.empty()) {
+        return;
+    }
+
+    cv::Mat source(height, width, CV_16SC1, depth_data.data());
+    cv::Mat rotated;
+    switch (quarter_turns) {
+    case 1:
+        cv::rotate(source, rotated, cv::ROTATE_90_CLOCKWISE);
+        break;
+    case 2:
+        cv::rotate(source, rotated, cv::ROTATE_180);
+        break;
+    case 3:
+        cv::rotate(source, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+        break;
+    default:
+        return;
+    }
+
+    width = rotated.cols;
+    height = rotated.rows;
+    depth_data.assign(
+        reinterpret_cast<const int16_t *>(rotated.data),
+        reinterpret_cast<const int16_t *>(rotated.data) + static_cast<std::ptrdiff_t>(rotated.total()));
 }
 
 void LCVision::Impl::resetEncoders() {

@@ -198,6 +198,10 @@ struct GoalConfig {
     bool        publish_debug_topics = true;
 };
 
+struct ImageConfig {
+    int rotation_degrees = 0;
+};
+
 enum class DetectorFramework {
     None,
     OpenVINO,
@@ -232,6 +236,9 @@ std::string trim(const std::string &value);
 std::string toLower(std::string value);
 std::string unquote(const std::string &value);
 int parseFirstInteger(const std::string &line);
+int normalizeRotationDegrees(int rotation_degrees);
+int rotationDegreesToQuarterTurns(int rotation_degrees);
+cv::Point2f rotatePoint(const cv::Point2f &point, const cv::Size &source_size, int quarter_turns);
 std::vector<std::string> defaultCocoClassNames();
 std::string defaultAstraSdkRoot();
 int defaultDetectorThreadCount();
@@ -457,9 +464,13 @@ struct LCVision::Impl {
         std::vector<uint8_t> &rgb_data, int &width, int &height, int64_t &frame_index, rclcpp::Time &stamp);
     [[nodiscard]] bool isHistogramDebugVideoEnabled() const;
     [[nodiscard]] bool isPeakMaskDebugVideoEnabled() const;
+    void rotateRgbFrame(std::vector<uint8_t> &rgb_data, int &width, int &height) const;
+    void rotateDepthFrame(std::vector<int16_t> &depth_data, int &width, int &height) const;
     cv::Rect scaleRectToSize(const cv::Rect &source_box, const cv::Size &source_size, const cv::Size &target_size)
         const;
-    void populateCameraPoints(std::vector<DetectionDepthResult> &results) const;
+    void populateCameraPoints(
+        std::vector<DetectionDepthResult> &results, const cv::Size &rotated_depth_size, const cv::Size &raw_depth_size)
+        const;
     void clearTrackedTarget();
     static cv::Point2f detectionCenter(const DetectionDepthResult &result);
     int selectTrackedDetection(
@@ -522,6 +533,7 @@ struct LCVision::Impl {
     std::string sdk_root;
     StreamConfig rgb;
     DepthConfig  depth;
+    ImageConfig  image;
     DetectorConfig detector;
     TrackingConfig tracking;
     GoalConfig     goal;

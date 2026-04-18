@@ -37,6 +37,7 @@ void LCVision::Impl::detectionLoop() {
             continue;
         }
 
+        rotateRgbFrame(rgb_data, width, height);
         next_detection_time = now + detection_period;
         last_detection_input_frame_index = frame_index;
 
@@ -50,8 +51,11 @@ void LCVision::Impl::detectionLoop() {
 
             std::vector<DetectionDepthResult> results;
             if (depth.enable && copyLatestDepthFrame(depth_data, depth_width, depth_height, depth_frame_index, depth_stamp)) {
+                const cv::Size raw_depth_size(depth_width, depth_height);
+                rotateDepthFrame(depth_data, depth_width, depth_height);
                 results =
                     estimateDepthResults(detections, cv::Size(width, height), depth_data, cv::Size(depth_width, depth_height));
+                populateCameraPoints(results, cv::Size(depth_width, depth_height), raw_depth_size);
             } else {
                 results.reserve(detections.size());
                 for (const auto &detection : detections) {
@@ -61,7 +65,6 @@ void LCVision::Impl::detectionLoop() {
                 }
             }
 
-            populateCameraPoints(results);
             maybeDispatchNavigationGoal(results, width, height, stamp);
             updateDetectionCache(results, width, height, frame_index, stamp);
             publishDetectionDepths(results, width, height, stamp);

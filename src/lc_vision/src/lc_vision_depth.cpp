@@ -19,22 +19,28 @@ cv::Rect LCVision::Impl::scaleRectToSize(
     return scaled_box;
 }
 
-void LCVision::Impl::populateCameraPoints(std::vector<DetectionDepthResult> &results) const {
+void LCVision::Impl::populateCameraPoints(
+    std::vector<DetectionDepthResult> &results, const cv::Size &rotated_depth_size, const cv::Size &raw_depth_size) const {
     if (!depth_stream.has_value()) {
         return;
     }
 
+    const int quarter_turns = rotationDegreesToQuarterTurns(image.rotation_degrees);
     const auto mapper = depth_stream->coordinateMapper();
     for (auto &result : results) {
         if (!result.depth_valid || result.peak_pixel_count == 0U) {
             continue;
         }
 
+        const cv::Point2f raw_centroid = rotatePoint(
+            cv::Point2f(result.peak_centroid_x, result.peak_centroid_y), rotated_depth_size, -quarter_turns);
         float world_x = 0.0f;
         float world_y = 0.0f;
         float world_z = 0.0f;
         mapper.convert_depth_to_world(
-            result.peak_centroid_x, result.peak_centroid_y, result.depth_mm, world_x, world_y, world_z);
+            std::clamp(raw_centroid.x, 0.0f, static_cast<float>(raw_depth_size.width - 1)),
+            std::clamp(raw_centroid.y, 0.0f, static_cast<float>(raw_depth_size.height - 1)), result.depth_mm, world_x,
+            world_y, world_z);
 
         result.camera_point.x = static_cast<double>(world_x) / 1000.0;
         result.camera_point.y = static_cast<double>(world_y) / 1000.0;
@@ -458,6 +464,8 @@ std::optional<foxglove_msgs::msg::CompressedVideo> LCVision::Impl::makeRgbMessag
         return std::nullopt;
     }
 
+    rotateRgbFrame(rgb_data, width, height);
+
     if (detector_runtime_enabled.load()) {
         cv::Size source_size;
         auto     detections = snapshotDetections(source_size);
@@ -513,6 +521,7 @@ std::optional<foxglove_msgs::msg::CompressedVideo> LCVision::Impl::makeDepthMess
         return std::nullopt;
     }
 
+    rotateDepthFrame(depth_data, width, height);
     buildDepthVisualization(depth_data, width, height, depth_visualization);
 
     cv::Mat depth_gray(height, width, CV_8UC1, depth_visualization.data());

@@ -269,6 +269,9 @@ void LCVision::getParams() {
         this->declare_parameter<bool>("depth.debug_video.peak_mask.enable", false);
     impl_->depth.debug_video.peak_mask.topic =
         this->declare_parameter<std::string>("depth.debug_video.peak_mask.topic", "~/depth_peak_mask/video");
+    impl_->image.rotation_degrees =
+        normalizeRotationDegrees(this->declare_parameter<int>("image.rotation_degrees", 0));
+    rotationDegreesToQuarterTurns(impl_->image.rotation_degrees);
 
     impl_->detector.enable = this->declare_parameter<bool>("detector.enable", true);
     impl_->detector.framework = this->declare_parameter<std::string>("detector.framework", "auto");
@@ -331,6 +334,7 @@ void LCVision::getParams() {
         impl_->depth.publish_fps, impl_->depth.bitrate_kbps, impl_->depth.gop_size,
         impl_->depth.visualization_min_mm, impl_->depth.visualization_max_mm, impl_->depth.roi_min_valid_mm,
         impl_->depth.roi_max_valid_mm);
+    RCLCPP_INFO(get_logger(), "Image config: rotation=%d degrees", impl_->image.rotation_degrees);
     RCLCPP_INFO(
         get_logger(),
         "Detector config: enable=%s framework=%s backend=%s available=[%s] model_dir=%s input=%d score=%.2f nms=%.2f fps=%d vulkan_device=%d cpu_threads=%d",
