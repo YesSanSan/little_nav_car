@@ -1,6 +1,6 @@
 # lc_vision
 
-`lc_vision` now supports Astra RGB/depth capture, Foxglove H.264 debug streams, and optional person detection with `ncnn`, with automatic Vulkan acceleration fallback to CPU.
+`lc_vision` now supports Astra RGB/depth capture, Foxglove H.264 debug streams, and optional person detection with runtime-selectable `openvino` or `ncnn` backends when they are available in the build.
 
 ## Install ncnn with vcpkg
 
@@ -10,20 +10,35 @@ git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
 ~/vcpkg/vcpkg install "ncnn[vulkan]:arm64-linux" --recurse
 ```
 
-## Export YOLO26 to NCNN
+## Export YOLO26 Models
+
+### NCNN
 
 ```bash
 cd /home/betty/help_ws/little_nav_car
 ./src/lc_vision/scripts/export_yolo26_ncnn.sh
 ```
 
-The default model directory is:
+The default NCNN model directory is:
 
 ```text
 src/lc_vision/models/yolo26n_ncnn_model
 ```
 
-You can switch to other exported Ultralytics NCNN models by overriding `detector.model_dir`.
+### OpenVINO
+
+```bash
+cd /home/betty/help_ws/little_nav_car
+./src/lc_vision/scripts/export_yolo26_openvino_fp16.sh
+```
+
+The default OpenVINO model directory is:
+
+```text
+src/lc_vision/models/yolo26n_openvino_model
+```
+
+You can switch to other exported Ultralytics models by overriding `detector.model_dir`. If `detector.model_dir` is empty, `lc_vision` chooses the default directory for the selected detector framework.
 
 ## Build
 
@@ -41,6 +56,7 @@ colcon build \
 The detector is configured in `config/vision.yaml`:
 
 - `detector.enable`
+- `detector.framework`
 - `detector.backend`
 - `detector.model_dir`
 - `detector.input_size`
@@ -51,8 +67,17 @@ The detector is configured in `config/vision.yaml`:
 - `detector.cpu_num_threads`
 - `detector.log_backend_info`
 - `detector.target_classes`
+- `depth.debug_video.histogram.enable`
+- `depth.debug_video.histogram.topic`
+- `depth.debug_video.peak_mask.enable`
+- `depth.debug_video.peak_mask.topic`
 
-`detector.backend` accepts `auto`, `vulkan`, or `cpu`. In `auto`, the node tries Vulkan first and falls back to CPU if GPU initialization fails.
+`detector.framework` accepts `auto`, `openvino`, or `ncnn`.
+
+`detector.backend` is interpreted by the selected framework:
+
+- `openvino`: `auto`, `cpu`, `gpu`
+- `ncnn`: `auto`, `vulkan`, `cpu`
 
 When model loading fails, the node continues publishing RGB/depth debug video without detection overlays.
 
@@ -79,17 +104,7 @@ When `depth.debug_marker.enable=true`, the node publishes a `visualization_msgs/
 
 ## Optional debug video streams
 
-Two optional debug streams can be compiled in:
-
-```bash
-colcon build \
-  --packages-select lc_vision \
-  --cmake-args \
-    -DLC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG=ON \
-    -DLC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG=ON
-```
-
-With these options enabled, the node can publish:
+These streams are now runtime-configurable from `config/vision.yaml`. When enabled, the node can publish:
 
 - `~/depth_histogram/video`
 - `~/depth_peak_mask/video`

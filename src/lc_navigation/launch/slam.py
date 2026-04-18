@@ -180,7 +180,7 @@ def generate_launch_description():
             ),
             Node(
                 package='lc_navigation',
-                executable='scan_self_filter.py',
+                executable='scan_self_filter',
                 name='scan_self_filter',
                 output='screen',
                 parameters=[

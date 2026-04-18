@@ -51,6 +51,7 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     use_localization = LaunchConfiguration('use_localization')
     use_lc_vision = LaunchConfiguration('use_lc_vision')
+    use_rviz = LaunchConfiguration('use_rviz')
 
     # Map fully qualified names to relative ones so the node's namespace can be prepended.
     # In case of the transforms (tf), currently, there doesn't seem to be a better alternative
@@ -113,6 +114,12 @@ def generate_launch_description():
         description='Whether to launch the lc_vision node.',
     )
 
+    declare_use_rviz_cmd = DeclareLaunchArgument(
+        'use_rviz',
+        default_value='True',
+        description='Whether to start RViz.',
+    )
+
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         'use_sim_time',
         default_value='false',
@@ -170,6 +177,7 @@ def generate_launch_description():
                 output='screen',
             ),
             Node(
+                condition=IfCondition(use_rviz),
                 package='rviz2',
                 namespace='',
                 executable='rviz2',
@@ -179,7 +187,7 @@ def generate_launch_description():
             ),
             Node(
                 package='lc_navigation',
-                executable='scan_self_filter.py',
+                executable='scan_self_filter',
                 name='scan_self_filter',
                 output='screen',
                 parameters=[self_filter_params_file],
@@ -275,6 +283,7 @@ def generate_launch_description():
     ld.add_action(declare_log_level_cmd)
     ld.add_action(declare_use_localization_cmd)
     ld.add_action(declare_use_lc_vision_cmd)
+    ld.add_action(declare_use_rviz_cmd)
 
     # Add the actions to launch all of the navigation nodes
     ld.add_action(bringup_cmd_group)

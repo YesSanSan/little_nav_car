@@ -1,19 +1,35 @@
 cmake_minimum_required(VERSION 3.8)
 project(lc_navigation)
 
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
 # find dependencies
 find_package(ament_cmake_auto REQUIRED)
-find_package(ament_cmake_python REQUIRED)
-# uncomment the following section in order to fill in
-# further dependencies manually.
-# find_package(<dependency> REQUIRED)
+ament_auto_find_build_dependencies()
 
-install(PROGRAMS
-  scripts/scan_self_filter.py
+add_executable(scan_self_filter
+  src/scan_self_filter.cpp
+)
+
+ament_target_dependencies(scan_self_filter
+  geometry_msgs
+  rcl_interfaces
+  rclcpp
+  sensor_msgs
+  tf2
+  tf2_ros
+  visualization_msgs
+)
+
+install(TARGETS
+  scan_self_filter
   DESTINATION lib/${PROJECT_NAME}
 )
 

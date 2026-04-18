@@ -63,14 +63,6 @@ if(OpenVINO_FOUND)
   set(LC_VISION_HAVE_OPENVINO ON)
 endif()
 
-set(LC_VISION_DETECTOR_FRAMEWORK "none")
-if(LC_VISION_HAVE_OPENVINO)
-  set(LC_VISION_DETECTOR_FRAMEWORK "openvino")
-elseif(LC_VISION_HAVE_NCNN)
-  set(LC_VISION_DETECTOR_FRAMEWORK "ncnn")
-endif()
-
-message(STATUS "lc_vision detector framework selection: ${LC_VISION_DETECTOR_FRAMEWORK}")
 if(LC_VISION_HAVE_OPENVINO)
   message(STATUS "OpenVINO detected at ${OPENVINO_ROOT}")
 endif()
@@ -83,23 +75,37 @@ endif()
 
 pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libavcodec libavformat libavutil libswscale)
 
-option(LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG "Enable depth histogram debug video stream" OFF)
-option(LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG "Enable depth peak mask debug video stream" OFF)
-
 find_library(ASTRA_LIBRARY NAMES astra HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 find_library(ASTRA_CORE_LIBRARY NAMES astra_core HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 find_library(ASTRA_CORE_API_LIBRARY NAMES astra_core_api HINTS "${ASTRA_SDK_ROOT}/lib" REQUIRED)
 
 set(LC_VISION_COMPONENT_TARGET ${PROJECT_NAME}_component)
 
-ament_auto_add_library(${LC_VISION_COMPONENT_TARGET} SHARED
+set(LC_VISION_SOURCES
   src/lc_vision.cpp
+  src/lc_vision_common.cpp
+  src/lc_vision_depth.cpp
+  src/lc_vision_detection.cpp
+  src/lc_vision_navigation.cpp
+  src/lc_vision_detector_backend.cpp
+)
+
+if(LC_VISION_HAVE_OPENVINO)
+  list(APPEND LC_VISION_SOURCES src/lc_vision_detector_backend_openvino.cpp)
+endif()
+
+if(LC_VISION_HAVE_NCNN)
+  list(APPEND LC_VISION_SOURCES src/lc_vision_detector_backend_ncnn.cpp)
+endif()
+
+ament_auto_add_library(${LC_VISION_COMPONENT_TARGET} SHARED
+  ${LC_VISION_SOURCES}
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DetectionDepth.msg"
   "msg/DetectionDepthArray.msg"
-  DEPENDENCIES std_msgs
+  DEPENDENCIES std_msgs geometry_msgs
 )
 
 target_include_directories(${LC_VISION_COMPONENT_TARGET}
@@ -122,9 +128,11 @@ target_link_libraries(${LC_VISION_COMPONENT_TARGET}
   pthread
 )
 
-if(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "openvino")
+if(LC_VISION_HAVE_OPENVINO)
   target_link_libraries(${LC_VISION_COMPONENT_TARGET} openvino::runtime)
-elseif(LC_VISION_DETECTOR_FRAMEWORK STREQUAL "ncnn")
+endif()
+
+if(LC_VISION_HAVE_NCNN)
   target_link_libraries(${LC_VISION_COMPONENT_TARGET} ncnn)
 endif()
 
@@ -132,10 +140,6 @@ target_compile_definitions(${LC_VISION_COMPONENT_TARGET}
   PRIVATE
     LC_VISION_HAVE_NCNN=$<IF:$<BOOL:${LC_VISION_HAVE_NCNN}>,1,0>
     LC_VISION_HAVE_OPENVINO=$<IF:$<BOOL:${LC_VISION_HAVE_OPENVINO}>,1,0>
-    LC_VISION_DETECTOR_FRAMEWORK_NCNN=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},ncnn>,1,0>
-    LC_VISION_DETECTOR_FRAMEWORK_OPENVINO=$<IF:$<STREQUAL:${LC_VISION_DETECTOR_FRAMEWORK},openvino>,1,0>
-    LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG=$<IF:$<BOOL:${LC_VISION_ENABLE_DEPTH_HISTOGRAM_DEBUG}>,1,0>
-    LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG=$<IF:$<BOOL:${LC_VISION_ENABLE_DEPTH_PEAK_MASK_DEBUG}>,1,0>
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target ${PROJECT_NAME} "rosidl_typesupport_cpp")

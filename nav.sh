@@ -52,9 +52,9 @@ fi
 export OPENVINO_ROOT="${OPENVINO_ROOT:-${DEFAULT_OPENVINO_ROOT}}"
 export ASTRA_SDK_ROOT="${ASTRA_SDK_ROOT:-${DEFAULT_ASTRA_SDK_ROOT}}"
 
-NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=True"
+NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=True use_rviz:=False"
 if [[ "${USE_LC_VISION}" != "true" ]]; then
-  NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=False"
+  NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=False use_rviz:=False"
 fi
 
 export STACK_TASK_NAMES="lidar|yesense|serial|localization|navigation"

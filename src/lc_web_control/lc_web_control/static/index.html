@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Little Nav Car 控制台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Little Nav Car</p>
+          <h1>局域网页面控制台</h1>
+          <p class="hero-copy">
+            在同一局域网内访问当前设备，统一控制 SLAM、导航、视觉追踪，并在地图上标记返航点。
+          </p>
+        </div>
+        <div class="hero-badge">
+          <span>地图点击可直接标记返航点</span>
+        </div>
+      </section>
+
+      <section class="grid">
+        <article class="panel">
+          <header class="panel-header">
+            <h2>系统控制</h2>
+            <span id="stackSummary" class="status-pill neutral">状态读取中</span>
+          </header>
+          <div class="button-row">
+            <button id="startSlamButton" class="primary">启动 SLAM</button>
+            <button id="stopSlamButton" class="ghost">停止 SLAM</button>
+          </div>
+          <div class="button-row">
+            <button id="startNavButton" class="primary">启动导航</button>
+            <button id="stopNavButton" class="ghost">停止导航</button>
+          </div>
+          <div class="status-grid">
+            <div>
+              <span class="label">SLAM 会话</span>
+              <strong id="slamStatus">未知</strong>
+            </div>
+            <div>
+              <span class="label">导航会话</span>
+              <strong id="navStatus">未知</strong>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <header class="panel-header">
+            <h2>视觉追踪</h2>
+            <span id="visionStatusPill" class="status-pill neutral">读取中</span>
+          </header>
+          <div class="button-row">
+            <button id="startTrackingButton" class="primary">开始追踪</button>
+            <button id="stopTrackingButton" class="ghost">停止追踪</button>
+          </div>
+          <div class="status-grid">
+            <div>
+              <span class="label">参数服务</span>
+              <strong id="visionServiceStatus">未知</strong>
+            </div>
+            <div>
+              <span class="label">跟踪状态</span>
+              <strong id="trackingFlagStatus">未知</strong>
+            </div>
+          </div>
+          <p id="visionHint" class="hint">`lc_vision` 运行后，可在这里直接开关视觉跟踪和目标点下发。</p>
+        </article>
+
+        <article class="panel">
+          <header class="panel-header">
+            <h2>返航点</h2>
+            <span id="returnStatusPill" class="status-pill neutral">未设置</span>
+          </header>
+          <div class="button-row">
+            <button id="markCurrentButton" class="primary">当前位置设为返航点</button>
+            <button id="clearReturnButton" class="ghost">清除返航点</button>
+          </div>
+          <div class="button-row">
+            <button id="returnHomeButton" class="warn">返航</button>
+          </div>
+          <div class="status-grid">
+            <div>
+              <span class="label">返航点</span>
+              <strong id="returnPoseText">未设置</strong>
+            </div>
+            <div>
+              <span class="label">机器人位姿</span>
+              <strong id="robotPoseText">未知</strong>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel panel-map">
+        <header class="panel-header">
+          <div>
+            <h2>地图预览</h2>
+            <p class="hint">单击地图即可把该点标记为返航点。蓝点是跟踪目标，橙色方块是当前规划目标。</p>
+          </div>
+          <span id="mapStatusPill" class="status-pill neutral">等待地图</span>
+        </header>
+        <div class="map-shell">
+          <canvas id="mapCanvas" width="640" height="480"></canvas>
+          <div id="mapOverlay" class="map-overlay">等待 /map 话题...</div>
+        </div>
+        <div class="legend">
+          <span><i class="legend-dot robot"></i>机器人</span>
+          <span><i class="legend-dot home"></i>返航点</span>
+          <span><i class="legend-dot target"></i>追踪目标</span>
+          <span><i class="legend-dot goal"></i>规划目标</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <header class="panel-header">
+          <h2>操作消息</h2>
+        </header>
+        <pre id="messageLog" class="log-box">控制台已加载，正在连接 ROS 页面服务...</pre>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
