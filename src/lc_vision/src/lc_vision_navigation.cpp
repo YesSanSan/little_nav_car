@@ -20,6 +20,140 @@ cv::Point2f LCVision::Impl::detectionCenter(const DetectionDepthResult &result) 
         static_cast<float>(result.detection.box.y) + static_cast<float>(result.detection.box.height) * 0.5f);
 }
 
+void LCVision::Impl::handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+    rclcpp_action::GoalUUID current_goal_id{};
+    bool                    have_current_goal = false;
+    {
+        std::lock_guard<std::mutex> lock(current_nav_goal_mutex);
+        if (current_nav_goal_handle != nullptr) {
+            current_goal_id = current_nav_goal_handle->get_goal_id();
+            have_current_goal = true;
+        }
+    }
+
+    bool saw_external_active_goal = false;
+    for (const auto &status : msg->status_list) {
+        const bool active =
+            status.status == action_msgs::msg::GoalStatus::STATUS_ACCEPTED ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_EXECUTING ||
+            status.status == action_msgs::msg::GoalStatus::STATUS_CANCELING;
+        if (!active) {
+            continue;
+        }
+
+        if (!have_current_goal || status.goal_info.goal_id.uuid != current_goal_id) {
+            saw_external_active_goal = true;
+            break;
+        }
+    }
+
+    external_navigation_active.store(saw_external_active_goal, std::memory_order_relaxed);
+}
+
+void LCVision::Impl::rememberTargetObservation(
+    const DetectionDepthResult &result, const int width, const rclcpp::Time &stamp,
+    const std::optional<geometry_msgs::msg::PointStamped> &map_point) {
+    remembered_target.available = true;
+    remembered_target.stamp = stamp;
+    remembered_target.image_offset_px = detectionCenter(result).x - static_cast<float>(width) * 0.5f;
+    remembered_target.camera_lateral_m =
+        result.camera_point_valid ? static_cast<float>(result.camera_point.x) : 0.0f;
+    remembered_target.map_point_valid = map_point.has_value();
+    if (map_point.has_value()) {
+        remembered_target.map_point = *map_point;
+    }
+}
+
+void LCVision::Impl::publishRecoveryCommand(const double angular_velocity) {
+    if (recovery_cmd_vel_pub == nullptr) {
+        return;
+    }
+
+    geometry_msgs::msg::Twist cmd;
+    cmd.angular.z = angular_velocity;
+    recovery_cmd_vel_pub->publish(cmd);
+}
+
+void LCVision::Impl::stopRecoveryRotation(const std::string &reason) {
+    if (!recovery_rotation.active) {
+        return;
+    }
+
+    recovery_rotation.active = false;
+    publishRecoveryCommand(0.0);
+    RCLCPP_INFO(node.get_logger(), "Stopped visual recovery rotation: %s", reason.c_str());
+}
+
+void LCVision::Impl::maybeRecoverLostTarget(const rclcpp::Time &stamp) {
+    if (!tracking.recovery.enable) {
+        return;
+    }
+
+    if (external_navigation_active.load(std::memory_order_relaxed)) {
+        if (recovery_rotation.active) {
+            stopRecoveryRotation("external navigation is active");
+        }
+        return;
+    }
+
+    if (navigation_goal_active.load(std::memory_order_relaxed)) {
+        if (recovery_rotation.active) {
+            stopRecoveryRotation("navigation is active");
+        }
+        return;
+    }
+
+    if (!remembered_target.available) {
+        if (recovery_rotation.active) {
+            stopRecoveryRotation("no remembered target");
+        }
+        return;
+    }
+
+    const double memory_age =
+        (stamp - remembered_target.stamp).seconds();
+    if (memory_age > static_cast<double>(tracking.recovery.memory_timeout_sec)) {
+        if (recovery_rotation.active) {
+            stopRecoveryRotation("remembered target expired");
+        }
+        remembered_target.available = false;
+        return;
+    }
+
+    if (!recovery_rotation.active &&
+        memory_age < static_cast<double>(tracking.recovery.lost_delay_sec)) {
+        return;
+    }
+
+    if (!recovery_rotation.active) {
+        int direction = 1;
+        if (std::abs(remembered_target.image_offset_px) > 1.0f) {
+            direction = remembered_target.image_offset_px > 0.0f ? -1 : 1;
+        } else if (std::abs(remembered_target.camera_lateral_m) > 1.0e-3f) {
+            direction = remembered_target.camera_lateral_m > 0.0f ? -1 : 1;
+        }
+
+        node.cancelCurrentNavigationGoal("vision target lost, starting visual recovery rotation");
+        tracked_target.goal_dispatched = false;
+        recovery_rotation.active = true;
+        recovery_rotation.direction = direction;
+        recovery_rotation.start_stamp = stamp;
+        RCLCPP_INFO(
+            node.get_logger(), "Started visual recovery rotation: direction=%d memory_age=%.2fs", direction, memory_age);
+    }
+
+    const double recovery_age = (stamp - recovery_rotation.start_stamp).seconds();
+    if (recovery_age > static_cast<double>(tracking.recovery.search_timeout_sec)) {
+        stopRecoveryRotation("recovery timeout");
+        clearTrackedTarget();
+        remembered_target.available = false;
+        return;
+    }
+
+    publishRecoveryCommand(
+        static_cast<double>(recovery_rotation.direction) * static_cast<double>(tracking.recovery.turn_speed_rad_s));
+}
+
 int LCVision::Impl::selectTrackedDetection(
     std::vector<DetectionDepthResult> &results, const int width, const int height, const rclcpp::Time &stamp) {
     if (!tracking_runtime_enabled.load(std::memory_order_relaxed)) {
@@ -82,6 +216,7 @@ int LCVision::Impl::selectTrackedDetection(
         }
 
         if (best_index >= 0) {
+            stopRecoveryRotation("target reacquired");
             tracked_target.lost_frames = 0;
             ++tracked_target.stable_frames;
             tracked_target.last_result = results[static_cast<size_t>(best_index)];
@@ -101,18 +236,12 @@ int LCVision::Impl::selectTrackedDetection(
     }
 
     const cv::Point2f image_center(static_cast<float>(width) * 0.5f, static_cast<float>(height) * 0.5f);
-    const double      center_gate =
-        static_cast<double>(std::min(width, height)) * static_cast<double>(tracking.initial_center_gate_ratio);
     double best_center_distance = std::numeric_limits<double>::infinity();
     int    best_index = -1;
 
     for (const int candidate_index : candidates) {
         const auto  &candidate = results[static_cast<size_t>(candidate_index)];
         const double center_distance = cv::norm(detectionCenter(candidate) - image_center);
-        if (center_distance > center_gate) {
-            continue;
-        }
-
         if (center_distance < best_center_distance ||
             (std::abs(center_distance - best_center_distance) < 1.0e-6 &&
              candidate.detection.score > results[static_cast<size_t>(best_index)].detection.score)) {
@@ -130,6 +259,7 @@ int LCVision::Impl::selectTrackedDetection(
     tracked_target.stable_frames = 1;
     tracked_target.lost_frames = 0;
     tracked_target.goal_dispatched = false;
+    stopRecoveryRotation("target acquired");
     tracked_target.last_result = results[static_cast<size_t>(best_index)];
     tracked_target.last_stamp = stamp;
     results[static_cast<size_t>(best_index)].selected = true;
@@ -462,15 +592,18 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
     std::vector<DetectionDepthResult> &results, const int width, const int height, const rclcpp::Time &stamp) {
     if (!goal_runtime_enabled.load(std::memory_order_relaxed) ||
         !tracking_runtime_enabled.load(std::memory_order_relaxed)) {
+        stopRecoveryRotation("tracking or goal runtime disabled");
         return;
     }
 
     const int selected_index = selectTrackedDetection(results, width, height, stamp);
     if (selected_index < 0) {
+        maybeRecoverLostTarget(stamp);
         return;
     }
 
     auto &selected = results[static_cast<size_t>(selected_index)];
+    rememberTargetObservation(selected, width, stamp);
     geometry_msgs::msg::PointStamped camera_point;
     camera_point.header.stamp = toBuiltinTime(stamp);
     camera_point.header.frame_id = depth.frame_id;
@@ -481,11 +614,14 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
         return;
     }
 
+    rememberTargetObservation(selected, width, stamp, map_point);
+
     const auto goal_pose = buildSafeGoalPose(map_point, stamp);
     publishTrackedTargetDebug(camera_point, map_point, goal_pose);
 
     if (!goal_pose.has_value() || tracked_target.goal_dispatched || tracked_target.stable_frames < goal.min_stable_frames ||
-        navigation_goal_active.load()) {
+        navigation_goal_active.load() ||
+        external_navigation_active.load(std::memory_order_relaxed)) {
         return;
     }
 

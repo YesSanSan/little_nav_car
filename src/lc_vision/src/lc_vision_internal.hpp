@@ -2,6 +2,7 @@
 
 #include "lc_vision.hpp"
 
+#include <action_msgs/msg/goal_status_array.hpp>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -43,6 +44,7 @@ extern "C" {
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <lc_vision/msg/detection_depth.hpp>
 #include <lc_vision/msg/detection_depth_array.hpp>
 #include <nav2_msgs/msg/costmap.hpp>
@@ -120,6 +122,10 @@ struct DepthDebugVideoStreamConfig {
 };
 
 struct DepthConfig : StreamConfig {
+    struct CameraPointConfig {
+        bool flip_x = false;
+    };
+
     struct EstimationConfig {
         int   min_valid_pixels = 50;
         int   histogram_bin_size_mm = 50;
@@ -152,6 +158,7 @@ struct DepthConfig : StreamConfig {
     int               roi_max_valid_mm = 5000;
     bool              invalid_as_black = true;
     bool              enable_registration = true;
+    CameraPointConfig camera_point;
     EstimationConfig  estimation;
     DebugMarkerConfig debug_marker;
     DebugVideoConfig  debug_video;
@@ -175,12 +182,22 @@ struct DetectorConfig {
 };
 
 struct TrackingConfig {
+    struct RecoveryConfig {
+        bool        enable = true;
+        std::string cmd_vel_topic = "/cmd_vel_nav";
+        float       turn_speed_rad_s = 0.8f;
+        float       lost_delay_sec = 0.2f;
+        float       memory_timeout_sec = 5.0f;
+        float       search_timeout_sec = 8.0f;
+    };
+
     bool  enable = true;
-    float initial_center_gate_ratio = 0.2f;
+    float initial_center_gate_ratio = 0.3f;
     int   max_lost_frames = 10;
     float min_iou_for_match = 0.05f;
     float max_center_distance_px = 120.0f;
     float max_depth_delta_mm = 800.0f;
+    RecoveryConfig recovery;
 };
 
 struct GoalConfig {
@@ -438,6 +455,21 @@ struct TrackedTargetState {
     rclcpp::Time         last_stamp;
 };
 
+struct RememberedTargetState {
+    bool                           available = false;
+    rclcpp::Time                   stamp;
+    geometry_msgs::msg::PointStamped map_point;
+    bool                           map_point_valid = false;
+    float                          image_offset_px = 0.0f;
+    float                          camera_lateral_m = 0.0f;
+};
+
+struct RecoveryRotationState {
+    bool         active = false;
+    int          direction = 1;
+    rclcpp::Time start_stamp;
+};
+
 struct LCVision::Impl {
     class CaptureListener : public astra::FrameListener {
     public:
@@ -487,6 +519,13 @@ struct LCVision::Impl {
         const;
     void clearTrackedTarget();
     static cv::Point2f detectionCenter(const DetectionDepthResult &result);
+    void handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg);
+    void rememberTargetObservation(
+        const DetectionDepthResult &result, int width, const rclcpp::Time &stamp,
+        const std::optional<geometry_msgs::msg::PointStamped> &map_point = std::nullopt);
+    void publishRecoveryCommand(double angular_velocity);
+    void stopRecoveryRotation(const std::string &reason);
+    void maybeRecoverLostTarget(const rclcpp::Time &stamp);
     int selectTrackedDetection(
         std::vector<DetectionDepthResult> &results, int width, int height, const rclcpp::Time &stamp);
     void storeCostmap(const nav2_msgs::msg::Costmap::SharedPtr msg);
@@ -579,10 +618,12 @@ struct LCVision::Impl {
     rclcpp::Publisher<lc_vision::msg::DetectionDepthArray>::SharedPtr detections_depth_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr depth_debug_marker_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr goal_debug_marker_pub;
+    rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           recovery_cmd_vel_pub;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_camera_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_map_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr selected_goal_pose_pub;
     rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr         costmap_sub;
+    rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub;
 
     std::thread capture_thread;
     std::thread publish_thread;
@@ -612,7 +653,10 @@ struct LCVision::Impl {
     int     depth_peak_mask_encoder_width = 0;
     int     depth_peak_mask_encoder_height = 0;
     TrackedTargetState tracked_target;
+    RememberedTargetState remembered_target;
+    RecoveryRotationState recovery_rotation;
     std::atomic<bool> navigation_goal_active{false};
+    std::atomic<bool> external_navigation_active{false};
     std::atomic<bool> tracking_runtime_enabled{true};
     std::atomic<bool> goal_runtime_enabled{true};
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle;

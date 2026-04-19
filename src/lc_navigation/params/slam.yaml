@@ -136,7 +136,7 @@ bt_navigator:
 controller_server:
   ros__parameters:
     # 控制器主循环频率。频率高，控制更跟手，但算力占用更高。
-    controller_frequency: 30.0
+    controller_frequency: 20.0
     costmap_update_timeout: 0.30
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001

@@ -19,12 +19,13 @@
     depth.bitrate_kbps: 500
     depth.gop_size: 24
     depth.frame_id: cam_optical_frame
-    depth.visualization_min_mm: 300
+    depth.visualization_min_mm: 500
     depth.visualization_max_mm: 10000
     depth.roi_min_valid_mm: 300
     depth.roi_max_valid_mm: 5000
     depth.invalid_as_black: true
     depth.enable_registration: true
+    depth.camera_point.flip_x: false
     depth.estimation.min_valid_pixels: 50
     depth.estimation.histogram_bin_size_mm: 50
     depth.estimation.peak_min_ratio: 0.25
@@ -53,7 +54,7 @@
     detector.input_size: 640
     detector.score_threshold: 0.25
     detector.nms_threshold: 0.45
-    detector.fps: 5
+    detector.fps: 10
     detector.vulkan_device_index: 0
     detector.cpu_num_threads: 2
     detector.log_backend_info: true
@@ -61,18 +62,24 @@
 
     tracking.enable: true
     tracking.initial_center_gate_ratio: 0.2
-    tracking.max_lost_frames: 10
+    tracking.max_lost_frames: 5
     tracking.min_iou_for_match: 0.05
     tracking.max_center_distance_px: 120.0
     tracking.max_depth_delta_mm: 800.0
+    tracking.recovery.enable: true
+    tracking.recovery.cmd_vel_topic: /cmd_vel_nav
+    tracking.recovery.turn_speed_rad_s: 0.8
+    tracking.recovery.lost_delay_sec: 0.2
+    tracking.recovery.memory_timeout_sec: 5.0
+    tracking.recovery.search_timeout_sec: 8.0
 
     goal.enable: true
     goal.global_frame_id: map
     goal.robot_frame_id: base_link
     goal.costmap_topic: /global_costmap/costmap_raw
-    goal.standoff_distance_m: 0.5
-    goal.max_target_distance_m: 1.0
-    goal.min_stable_frames: 3
+    goal.standoff_distance_m: 0.7
+    goal.max_target_distance_m: 1.1
+    goal.min_stable_frames: 1
     goal.clearance_radius_m: 0.25
     goal.max_cell_cost: 80
     goal.longitudinal_search_step_m: 0.05

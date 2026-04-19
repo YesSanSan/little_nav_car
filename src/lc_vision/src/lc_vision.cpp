@@ -51,6 +51,19 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 impl_->goal.debug_marker.topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
         }
 
+        if (impl_->tracking.recovery.enable) {
+            auto cmd_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+            cmd_qos.reliable();
+            impl_->recovery_cmd_vel_pub = create_publisher<geometry_msgs::msg::Twist>(
+                impl_->tracking.recovery.cmd_vel_topic, cmd_qos);
+        }
+
+        impl_->navigate_to_pose_status_sub = create_subscription<action_msgs::msg::GoalStatusArray>(
+            "navigate_to_pose/_action/status", rclcpp::QoS(rclcpp::KeepLast(20)).reliable(),
+            [impl = impl_.get()](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
+                impl->handleNavigateToPoseStatus(msg);
+            });
+
         if (impl_->goal.publish_debug_topics) {
             impl_->selected_target_camera_point_pub =
                 create_publisher<geometry_msgs::msg::PointStamped>("~/selected_target_camera_point", detection_qos);
@@ -239,6 +252,7 @@ void LCVision::getParams() {
     impl_->depth.roi_max_valid_mm = this->declare_parameter<int>("depth.roi_max_valid_mm", 5000);
     impl_->depth.invalid_as_black = this->declare_parameter<bool>("depth.invalid_as_black", true);
     impl_->depth.enable_registration = this->declare_parameter<bool>("depth.enable_registration", true);
+    impl_->depth.camera_point.flip_x = this->declare_parameter<bool>("depth.camera_point.flip_x", false);
     impl_->depth.estimation.min_valid_pixels =
         this->declare_parameter<int>("depth.estimation.min_valid_pixels", 50);
     impl_->depth.estimation.histogram_bin_size_mm =
@@ -306,6 +320,17 @@ void LCVision::getParams() {
         static_cast<float>(this->declare_parameter<double>("tracking.max_center_distance_px", 120.0));
     impl_->tracking.max_depth_delta_mm =
         static_cast<float>(this->declare_parameter<double>("tracking.max_depth_delta_mm", 800.0));
+    impl_->tracking.recovery.enable = this->declare_parameter<bool>("tracking.recovery.enable", true);
+    impl_->tracking.recovery.cmd_vel_topic =
+        this->declare_parameter<std::string>("tracking.recovery.cmd_vel_topic", "/cmd_vel_nav");
+    impl_->tracking.recovery.turn_speed_rad_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.recovery.turn_speed_rad_s", 0.8));
+    impl_->tracking.recovery.lost_delay_sec =
+        static_cast<float>(this->declare_parameter<double>("tracking.recovery.lost_delay_sec", 0.2));
+    impl_->tracking.recovery.memory_timeout_sec =
+        static_cast<float>(this->declare_parameter<double>("tracking.recovery.memory_timeout_sec", 5.0));
+    impl_->tracking.recovery.search_timeout_sec =
+        static_cast<float>(this->declare_parameter<double>("tracking.recovery.search_timeout_sec", 8.0));
 
     impl_->goal.enable = this->declare_parameter<bool>("goal.enable", true);
     impl_->goal.global_frame_id = this->declare_parameter<std::string>("goal.global_frame_id", "map");
@@ -367,7 +392,7 @@ void LCVision::getParams() {
         impl_->detector.vulkan_device_index, impl_->detector.cpu_num_threads);
     RCLCPP_INFO(
         get_logger(),
-        "Depth estimation config: min_valid=%d bin=%dmm peak_ratio=%.2f peak_min=%d min_peak=%d trim=%.2f annotate_rgb=%s annotate_depth=%s marker=%s debug_hist=%s debug_peak=%s",
+        "Depth estimation config: min_valid=%d bin=%dmm peak_ratio=%.2f peak_min=%d min_peak=%d trim=%.2f annotate_rgb=%s annotate_depth=%s marker=%s debug_hist=%s debug_peak=%s flip_x=%s",
         impl_->depth.estimation.min_valid_pixels, impl_->depth.estimation.histogram_bin_size_mm,
         impl_->depth.estimation.peak_min_ratio, impl_->depth.estimation.peak_min_count,
         impl_->depth.estimation.min_peak_pixels, impl_->depth.estimation.trim_ratio,
@@ -375,13 +400,15 @@ void LCVision::getParams() {
         impl_->depth.estimation.annotate_depth_on_depth ? "true" : "false",
         impl_->depth.debug_marker.enable ? "true" : "false",
         impl_->depth.debug_video.histogram.enable ? "true" : "false",
-        impl_->depth.debug_video.peak_mask.enable ? "true" : "false");
+        impl_->depth.debug_video.peak_mask.enable ? "true" : "false",
+        impl_->depth.camera_point.flip_x ? "true" : "false");
     RCLCPP_INFO(
         get_logger(),
-        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d min_iou=%.2f max_center=%.1f max_depth_delta=%.1f",
+        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d min_iou=%.2f max_center=%.1f max_depth_delta=%.1f recovery=%s turn=%.2frad/s",
         impl_->tracking.enable ? "true" : "false", impl_->tracking.initial_center_gate_ratio,
         impl_->tracking.max_lost_frames, impl_->tracking.min_iou_for_match,
-        impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm);
+        impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm,
+        impl_->tracking.recovery.enable ? "true" : "false", impl_->tracking.recovery.turn_speed_rad_s);
     RCLCPP_INFO(
         get_logger(),
         "Goal config: enable=%s global_frame=%s robot_frame=%s costmap=%s standoff=%.2fm max_target_distance=%.2fm stable_frames=%d clearance=%.2fm debug_marker=%s",
@@ -557,6 +584,7 @@ LCVision::handleRuntimeParameters(const std::vector<rclcpp::Parameter> &paramete
 
         if (!tracking_enabled || !goal_enabled) {
             cancelCurrentNavigationGoal("vision tracking disabled");
+            impl_->stopRecoveryRotation("vision tracking disabled");
         }
     }
 

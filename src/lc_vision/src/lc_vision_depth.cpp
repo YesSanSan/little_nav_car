@@ -42,8 +42,13 @@ void LCVision::Impl::populateCameraPoints(
             std::clamp(raw_centroid.y, 0.0f, static_cast<float>(raw_depth_size.height - 1)), result.depth_mm, world_x,
             world_y, world_z);
 
+        if (depth.camera_point.flip_x) {
+            world_x = -world_x;
+        }
+
+        // Astra/OpenNI world coordinates use +Y upward, while ROS optical frames use +Y downward.
         result.camera_point.x = static_cast<double>(world_x) / 1000.0;
-        result.camera_point.y = static_cast<double>(world_y) / 1000.0;
+        result.camera_point.y = static_cast<double>(-world_y) / 1000.0;
         result.camera_point.z = static_cast<double>(world_z) / 1000.0;
         result.camera_point_valid = std::isfinite(result.camera_point.x) && std::isfinite(result.camera_point.y) &&
                                     std::isfinite(result.camera_point.z);
