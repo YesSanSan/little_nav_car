@@ -71,6 +71,7 @@
     goal.robot_frame_id: base_link
     goal.costmap_topic: /global_costmap/costmap_raw
     goal.standoff_distance_m: 0.5
+    goal.max_target_distance_m: 1.0
     goal.min_stable_frames: 3
     goal.clearance_radius_m: 0.25
     goal.max_cell_cost: 80
@@ -79,3 +80,11 @@
     goal.lateral_search_step_m: 0.1
     goal.max_lateral_offset_m: 0.4
     goal.publish_debug_topics: true
+    goal.debug_marker.enable: true
+    goal.debug_marker.topic: ~/target_map_debug_marker
+    goal.debug_marker.frame_id: map
+    goal.debug_marker.point_scale: 0.18
+    goal.debug_marker.text_scale: 0.16
+    goal.debug_marker.alpha: 0.9
+    goal.debug_marker.z: 0.08
+    goal.debug_marker.text_z_offset: 0.18

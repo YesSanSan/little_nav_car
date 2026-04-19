@@ -287,11 +287,14 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
     const double dir_y = delta_y / distance;
     const double lateral_x = -dir_y;
     const double lateral_y = dir_x;
+    const double max_target_distance = std::max(
+        static_cast<double>(goal.standoff_distance_m), static_cast<double>(goal.max_target_distance_m));
     const int    lateral_steps = std::max(
         0, static_cast<int>(std::floor(goal.max_lateral_offset_m / std::max(goal.lateral_search_step_m, 1.0e-3f))));
 
     const auto try_candidate =
-        [&](const double backoff_distance, const double lateral_offset) -> std::optional<geometry_msgs::msg::PoseStamped> {
+        [&](const double backoff_distance, const double lateral_offset,
+            const bool require_ray_free) -> std::optional<geometry_msgs::msg::PoseStamped> {
         geometry_msgs::msg::Point candidate;
         candidate.x = target_costmap_point.point.x - dir_x * backoff_distance + lateral_x * lateral_offset;
         candidate.y = target_costmap_point.point.y - dir_y * backoff_distance + lateral_y * lateral_offset;
@@ -301,7 +304,7 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
             return std::nullopt;
         }
 
-        if (!isRayFree(costmap, robot_map_point.point, candidate)) {
+        if (require_ray_free && !isRayFree(costmap, robot_map_point.point, candidate)) {
             return std::nullopt;
         }
 
@@ -316,22 +319,37 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
         return pose;
     };
 
-    for (double backoff = goal.standoff_distance_m;
-         backoff <= goal.standoff_distance_m + goal.max_backoff_distance_m + 1.0e-6;
-         backoff += std::max(goal.longitudinal_search_step_m, 1.0e-3f)) {
-        if (const auto center_pose = try_candidate(backoff, 0.0); center_pose.has_value()) {
-            return center_pose;
+    const auto search_candidates =
+        [&](const bool require_ray_free) -> std::optional<geometry_msgs::msg::PoseStamped> {
+        for (double backoff = goal.standoff_distance_m; backoff <= max_target_distance + 1.0e-6;
+             backoff += std::max(goal.longitudinal_search_step_m, 1.0e-3f)) {
+            if (const auto center_pose = try_candidate(backoff, 0.0, require_ray_free); center_pose.has_value()) {
+                return center_pose;
+            }
+
+            for (int step = 1; step <= lateral_steps; ++step) {
+                const double offset = static_cast<double>(step) * goal.lateral_search_step_m;
+                if (const auto left_pose = try_candidate(backoff, offset, require_ray_free); left_pose.has_value()) {
+                    return left_pose;
+                }
+                if (const auto right_pose = try_candidate(backoff, -offset, require_ray_free); right_pose.has_value()) {
+                    return right_pose;
+                }
+            }
         }
 
-        for (int step = 1; step <= lateral_steps; ++step) {
-            const double offset = static_cast<double>(step) * goal.lateral_search_step_m;
-            if (const auto left_pose = try_candidate(backoff, offset); left_pose.has_value()) {
-                return left_pose;
-            }
-            if (const auto right_pose = try_candidate(backoff, -offset); right_pose.has_value()) {
-                return right_pose;
-            }
-        }
+        return std::nullopt;
+    };
+
+    if (const auto strict_pose = search_candidates(true); strict_pose.has_value()) {
+        return strict_pose;
+    }
+
+    if (const auto relaxed_pose = search_candidates(false); relaxed_pose.has_value()) {
+        RCLCPP_INFO_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000,
+            "Using relaxed vision goal search within %.2fm of the target", goal.max_target_distance_m);
+        return relaxed_pose;
     }
 
     return std::nullopt;
@@ -353,6 +371,91 @@ void LCVision::Impl::publishTrackedTargetDebug(
     if (goal_pose.has_value() && selected_goal_pose_pub != nullptr) {
         selected_goal_pose_pub->publish(*goal_pose);
     }
+}
+
+void LCVision::Impl::publishGoalDebugMarkers(
+    const std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp) {
+    if (goal_debug_marker_pub == nullptr || !goal.debug_marker.enable) {
+        return;
+    }
+
+    visualization_msgs::msg::MarkerArray marker_array;
+    visualization_msgs::msg::Marker      clear_marker;
+    clear_marker.header.stamp = toBuiltinTime(stamp);
+    clear_marker.header.frame_id = goal.debug_marker.frame_id;
+    clear_marker.action = visualization_msgs::msg::Marker::DELETEALL;
+    marker_array.markers.push_back(clear_marker);
+
+    int marker_id = 0;
+    for (const auto &result : results) {
+        if (!result.camera_point_valid) {
+            continue;
+        }
+
+        geometry_msgs::msg::PointStamped camera_point;
+        camera_point.header.stamp = toBuiltinTime(stamp);
+        camera_point.header.frame_id = depth.frame_id;
+        camera_point.point = result.camera_point;
+
+        geometry_msgs::msg::PointStamped map_point;
+        if (!transformPointToFrame(camera_point, goal.debug_marker.frame_id, map_point)) {
+            continue;
+        }
+
+        const bool is_selected = result.selected;
+        const float alpha = std::clamp(goal.debug_marker.alpha, 0.0f, 1.0f);
+
+        visualization_msgs::msg::Marker point_marker;
+        point_marker.header.stamp = toBuiltinTime(stamp);
+        point_marker.header.frame_id = goal.debug_marker.frame_id;
+        point_marker.ns = "goal_debug_points";
+        point_marker.id = marker_id++;
+        point_marker.type = visualization_msgs::msg::Marker::SPHERE;
+        point_marker.action = visualization_msgs::msg::Marker::ADD;
+        point_marker.pose.position = map_point.point;
+        point_marker.pose.position.z = goal.debug_marker.z;
+        point_marker.pose.orientation.w = 1.0;
+        point_marker.scale.x = std::max(1.0e-3f, goal.debug_marker.point_scale);
+        point_marker.scale.y = std::max(1.0e-3f, goal.debug_marker.point_scale);
+        point_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.point_scale);
+        point_marker.color.r = is_selected ? 0.95f : 0.15f;
+        point_marker.color.g = is_selected ? 0.35f : 0.85f;
+        point_marker.color.b = is_selected ? 0.20f : 0.95f;
+        point_marker.color.a = alpha;
+        marker_array.markers.push_back(std::move(point_marker));
+
+        visualization_msgs::msg::Marker text_marker;
+        text_marker.header.stamp = toBuiltinTime(stamp);
+        text_marker.header.frame_id = goal.debug_marker.frame_id;
+        text_marker.ns = "goal_debug_labels";
+        text_marker.id = marker_id++;
+        text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+        text_marker.action = visualization_msgs::msg::Marker::ADD;
+        text_marker.pose.position = map_point.point;
+        text_marker.pose.position.z = goal.debug_marker.z + goal.debug_marker.text_z_offset;
+        text_marker.pose.orientation.w = 1.0;
+        text_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.text_scale);
+        text_marker.color.r = 1.0f;
+        text_marker.color.g = 1.0f;
+        text_marker.color.b = 1.0f;
+        text_marker.color.a = alpha;
+
+        const double distance_m = static_cast<double>(result.depth_mm) / 1000.0;
+        std::ostringstream label_stream;
+        label_stream.setf(std::ios::fixed);
+        label_stream.precision(2);
+        label_stream << result.detection.label << " " << distance_m << "m";
+        if (result.track_id >= 0) {
+            label_stream << " id=" << result.track_id;
+        }
+        if (is_selected) {
+            label_stream << " selected";
+        }
+        text_marker.text = label_stream.str();
+        marker_array.markers.push_back(std::move(text_marker));
+    }
+
+    goal_debug_marker_pub->publish(marker_array);
 }
 
 void LCVision::Impl::maybeDispatchNavigationGoal(

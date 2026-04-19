@@ -69,6 +69,7 @@ void LCVision::Impl::detectionLoop() {
             updateDetectionCache(results, width, height, frame_index, stamp);
             publishDetectionDepths(results, width, height, stamp);
             publishDepthDebugMarkers(results, stamp);
+            publishGoalDebugMarkers(results, stamp);
 
             if (isHistogramDebugVideoEnabled()) {
                 updateHistogramDebugFrame(results, frame_index, stamp);

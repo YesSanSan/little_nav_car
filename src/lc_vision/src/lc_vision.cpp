@@ -46,6 +46,11 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 impl_->depth.debug_marker.topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
         }
 
+        if (impl_->goal.debug_marker.enable) {
+            impl_->goal_debug_marker_pub = create_publisher<visualization_msgs::msg::MarkerArray>(
+                impl_->goal.debug_marker.topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+        }
+
         if (impl_->goal.publish_debug_topics) {
             impl_->selected_target_camera_point_pub =
                 create_publisher<geometry_msgs::msg::PointStamped>("~/selected_target_camera_point", detection_qos);
@@ -309,6 +314,8 @@ void LCVision::getParams() {
         this->declare_parameter<std::string>("goal.costmap_topic", "/global_costmap/costmap_raw");
     impl_->goal.standoff_distance_m =
         static_cast<float>(this->declare_parameter<double>("goal.standoff_distance_m", 0.5));
+    impl_->goal.max_target_distance_m =
+        static_cast<float>(this->declare_parameter<double>("goal.max_target_distance_m", 1.0));
     impl_->goal.min_stable_frames = this->declare_parameter<int>("goal.min_stable_frames", 3);
     impl_->goal.clearance_radius_m =
         static_cast<float>(this->declare_parameter<double>("goal.clearance_radius_m", 0.25));
@@ -322,6 +329,21 @@ void LCVision::getParams() {
     impl_->goal.max_lateral_offset_m =
         static_cast<float>(this->declare_parameter<double>("goal.max_lateral_offset_m", 0.4));
     impl_->goal.publish_debug_topics = this->declare_parameter<bool>("goal.publish_debug_topics", true);
+    impl_->goal.debug_marker.enable = this->declare_parameter<bool>("goal.debug_marker.enable", false);
+    impl_->goal.debug_marker.topic =
+        this->declare_parameter<std::string>("goal.debug_marker.topic", "~/target_map_debug_marker");
+    impl_->goal.debug_marker.frame_id =
+        this->declare_parameter<std::string>("goal.debug_marker.frame_id", "map");
+    impl_->goal.debug_marker.point_scale =
+        static_cast<float>(this->declare_parameter<double>("goal.debug_marker.point_scale", 0.18));
+    impl_->goal.debug_marker.text_scale =
+        static_cast<float>(this->declare_parameter<double>("goal.debug_marker.text_scale", 0.16));
+    impl_->goal.debug_marker.alpha =
+        static_cast<float>(this->declare_parameter<double>("goal.debug_marker.alpha", 0.9));
+    impl_->goal.debug_marker.z =
+        static_cast<float>(this->declare_parameter<double>("goal.debug_marker.z", 0.08));
+    impl_->goal.debug_marker.text_z_offset =
+        static_cast<float>(this->declare_parameter<double>("goal.debug_marker.text_z_offset", 0.18));
 
     RCLCPP_INFO(
         get_logger(), "RGB config: enable=%s capture=%dx%d@%d publish=%d bitrate=%dkbps gop=%d",
@@ -362,10 +384,11 @@ void LCVision::getParams() {
         impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm);
     RCLCPP_INFO(
         get_logger(),
-        "Goal config: enable=%s global_frame=%s robot_frame=%s costmap=%s standoff=%.2fm stable_frames=%d clearance=%.2fm",
+        "Goal config: enable=%s global_frame=%s robot_frame=%s costmap=%s standoff=%.2fm max_target_distance=%.2fm stable_frames=%d clearance=%.2fm debug_marker=%s",
         impl_->goal.enable ? "true" : "false", impl_->goal.global_frame_id.c_str(),
         impl_->goal.robot_frame_id.c_str(), impl_->goal.costmap_topic.c_str(), impl_->goal.standoff_distance_m,
-        impl_->goal.min_stable_frames, impl_->goal.clearance_radius_m);
+        impl_->goal.max_target_distance_m, impl_->goal.min_stable_frames, impl_->goal.clearance_radius_m,
+        impl_->goal.debug_marker.enable ? "true" : "false");
 }
 
 void LCVision::prepareModel() {

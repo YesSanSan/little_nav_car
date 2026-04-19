@@ -21,6 +21,7 @@
 #include <optional>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -183,11 +184,23 @@ struct TrackingConfig {
 };
 
 struct GoalConfig {
+    struct DebugMarkerConfig {
+        bool        enable = false;
+        std::string topic = "~/target_map_debug_marker";
+        std::string frame_id = "map";
+        float       point_scale = 0.18f;
+        float       text_scale = 0.16f;
+        float       alpha = 0.9f;
+        float       z = 0.08f;
+        float       text_z_offset = 0.18f;
+    };
+
     bool        enable = true;
     std::string global_frame_id = "map";
     std::string robot_frame_id = "base_link";
     std::string costmap_topic = "/global_costmap/costmap_raw";
     float       standoff_distance_m = 0.5f;
+    float       max_target_distance_m = 1.0f;
     int         min_stable_frames = 3;
     float       clearance_radius_m = 0.25f;
     int         max_cell_cost = 80;
@@ -196,6 +209,7 @@ struct GoalConfig {
     float       lateral_search_step_m = 0.1f;
     float       max_lateral_offset_m = 0.4f;
     bool        publish_debug_topics = true;
+    DebugMarkerConfig debug_marker;
 };
 
 struct ImageConfig {
@@ -494,6 +508,7 @@ struct LCVision::Impl {
     void publishTrackedTargetDebug(
         const geometry_msgs::msg::PointStamped &camera_point, const geometry_msgs::msg::PointStamped &map_point,
         const std::optional<geometry_msgs::msg::PoseStamped> &goal_pose);
+    void publishGoalDebugMarkers(const std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
     void maybeDispatchNavigationGoal(
         std::vector<DetectionDepthResult> &results, int width, int height, const rclcpp::Time &stamp);
     DetectionDepthResult estimateDepthForDetection(
@@ -563,6 +578,7 @@ struct LCVision::Impl {
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr depth_peak_mask_video_pub;
     rclcpp::Publisher<lc_vision::msg::DetectionDepthArray>::SharedPtr detections_depth_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr depth_debug_marker_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr goal_debug_marker_pub;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_camera_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_map_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr selected_goal_pose_pub;
