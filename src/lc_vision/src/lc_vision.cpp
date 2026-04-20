@@ -83,6 +83,19 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 });
         }
 
+        if (impl_->tracking.lidar.enable && !impl_->tracking.lidar.pointcloud_topic.empty()) {
+            impl_->lidar_pointcloud_sub = create_subscription<sensor_msgs::msg::PointCloud2>(
+                impl_->tracking.lidar.pointcloud_topic, rclcpp::SensorDataQoS(),
+                [impl = impl_.get()](const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+                    impl->storePointCloud(msg);
+                });
+            if (impl_->tracking.lidar.self_filter_enable &&
+                !impl_->tracking.lidar.self_filter_node_name.empty()) {
+                impl_->lidar_self_filter_param_client = std::make_shared<rclcpp::AsyncParametersClient>(
+                    this, impl_->tracking.lidar.self_filter_node_name);
+            }
+        }
+
         if (impl_->rgb.enable) {
             auto color_stream = impl_->reader.stream<astra::ColorStream>();
             if (!color_stream.is_available()) {
@@ -348,6 +361,47 @@ void LCVision::getParams() {
         this->declare_parameter<int>("tracking.debug.max_track_memories", 32);
     impl_->tracking.debug.track_memory_timeout_sec =
         static_cast<float>(this->declare_parameter<double>("tracking.debug.track_memory_timeout_sec", 3.0));
+    impl_->tracking.lidar.enable = this->declare_parameter<bool>("tracking.lidar.enable", true);
+    impl_->tracking.lidar.pointcloud_topic =
+        this->declare_parameter<std::string>("tracking.lidar.pointcloud_topic", "/lslidar_point_cloud");
+    impl_->tracking.lidar.target_frame =
+        this->declare_parameter<std::string>("tracking.lidar.target_frame", "base_link");
+    impl_->tracking.lidar.min_x_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.min_x_m", 0.05));
+    impl_->tracking.lidar.max_x_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.max_x_m", 3.0));
+    impl_->tracking.lidar.min_y_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.min_y_m", -1.5));
+    impl_->tracking.lidar.max_y_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.max_y_m", 1.5));
+    impl_->tracking.lidar.min_z_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.min_z_m", -0.3));
+    impl_->tracking.lidar.max_z_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.max_z_m", 1.8));
+    impl_->tracking.lidar.horizontal_fov_rad =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.horizontal_fov_rad", 1.2217));
+    impl_->tracking.lidar.bearing_gate_base_rad =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.bearing_gate_base_rad", 0.20));
+    impl_->tracking.lidar.bearing_gate_box_scale_rad =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.bearing_gate_box_scale_rad", 0.70));
+    impl_->tracking.lidar.range_gate_margin_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.range_gate_margin_m", 0.60));
+    impl_->tracking.lidar.cluster_tolerance_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.cluster_tolerance_m", 0.18));
+    impl_->tracking.lidar.min_cluster_points =
+        this->declare_parameter<int>("tracking.lidar.min_cluster_points", 3);
+    impl_->tracking.lidar.max_cluster_points =
+        this->declare_parameter<int>("tracking.lidar.max_cluster_points", 200);
+    impl_->tracking.lidar.candidate_keep_count =
+        this->declare_parameter<int>("tracking.lidar.candidate_keep_count", 5);
+    impl_->tracking.lidar.safety_margin_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.safety_margin_m", 0.05));
+    impl_->tracking.lidar.camera_lidar_consistency_margin_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.lidar.camera_lidar_consistency_margin_m", 0.35));
+    impl_->tracking.lidar.self_filter_enable =
+        this->declare_parameter<bool>("tracking.lidar.self_filter.enable", true);
+    impl_->tracking.lidar.self_filter_node_name =
+        this->declare_parameter<std::string>("tracking.lidar.self_filter.node_name", "/scan_self_filter");
     impl_->tracking.recovery.enable = this->declare_parameter<bool>("tracking.recovery.enable", true);
     impl_->tracking.recovery.cmd_vel_topic =
         this->declare_parameter<std::string>("tracking.recovery.cmd_vel_topic", "/cmd_vel_nav");
@@ -469,6 +523,9 @@ void LCVision::getParams() {
         get_logger(),
         "Tracking config: enable=%s center_gate=%.2f lost_frames=%d map_match=[dist=%.2fm angle=%.2frad] min_iou=%.2f "
         "max_center=%.1f max_depth_delta=%.1f verbose_logs=%s track_memory=[max=%d timeout=%.2fs] "
+        "lidar=[enable=%s topic=%s frame=%s x=[%.2f,%.2f] y=[%.2f,%.2f] z=[%.2f,%.2f] fov=%.2frad gate_base=%.2frad gate_box=%.2frad "
+        "range_margin=%.2fm cluster_tol=%.2fm min_cluster=%d max_cluster=%d keep=%d safety_margin=%.2fm consistency_margin=%.2fm "
+        "self_filter=%s node=%s] "
         "recovery=%s turn=%.2frad/s reacquire=%.2frad/s visual_servo=%s engage=%.2fm lost=%.2fm",
         impl_->tracking.enable ? "true" : "false", impl_->tracking.initial_center_gate_ratio,
         impl_->tracking.max_lost_frames, impl_->tracking.map_match.distance_tolerance_m,
@@ -476,6 +533,17 @@ void LCVision::getParams() {
         impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm,
         impl_->tracking.debug.enable_verbose_logs ? "true" : "false",
         impl_->tracking.debug.max_track_memories, impl_->tracking.debug.track_memory_timeout_sec,
+        impl_->tracking.lidar.enable ? "true" : "false", impl_->tracking.lidar.pointcloud_topic.c_str(),
+        impl_->tracking.lidar.target_frame.c_str(), impl_->tracking.lidar.min_x_m, impl_->tracking.lidar.max_x_m,
+        impl_->tracking.lidar.min_y_m, impl_->tracking.lidar.max_y_m, impl_->tracking.lidar.min_z_m,
+        impl_->tracking.lidar.max_z_m, impl_->tracking.lidar.horizontal_fov_rad,
+        impl_->tracking.lidar.bearing_gate_base_rad, impl_->tracking.lidar.bearing_gate_box_scale_rad,
+        impl_->tracking.lidar.range_gate_margin_m, impl_->tracking.lidar.cluster_tolerance_m,
+        impl_->tracking.lidar.min_cluster_points, impl_->tracking.lidar.max_cluster_points,
+        impl_->tracking.lidar.candidate_keep_count, impl_->tracking.lidar.safety_margin_m,
+        impl_->tracking.lidar.camera_lidar_consistency_margin_m,
+        impl_->tracking.lidar.self_filter_enable ? "true" : "false",
+        impl_->tracking.lidar.self_filter_node_name.c_str(),
         impl_->tracking.recovery.enable ? "true" : "false", impl_->tracking.recovery.turn_speed_rad_s,
         impl_->tracking.recovery.reacquire_turn_speed_rad_s,
         impl_->tracking.visual_servo.enable ? "true" : "false", impl_->tracking.visual_servo.engage_distance_m,

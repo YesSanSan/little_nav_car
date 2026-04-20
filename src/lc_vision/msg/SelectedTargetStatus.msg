@@ -7,6 +7,10 @@ bool camera_depth_valid
 float32 camera_depth_mm
 bool control_distance_valid
 float32 control_distance_mm
+string control_distance_source
+bool lidar_safety_valid
+float32 lidar_safety_distance_mm
+uint32 lidar_candidate_count
 float32 roi_invalid_ratio
 uint32 roi_valid_pixel_count
 uint32 roi_invalid_pixel_count

@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -54,7 +55,10 @@ extern "C" {
 #include <rclcpp/logging.hpp>
 #include <rclcpp/node_interfaces/node_parameters_interface.hpp>
 #include <rclcpp/parameter.hpp>
+#include <rclcpp/parameter_client.hpp>
 #include <rclcpp/qos.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -121,6 +125,11 @@ struct DetectionDepthResult {
     DepthQualityState        depth_quality_state = DepthQualityState::Invalid;
     bool                     control_distance_valid = false;
     float                    control_distance_mm = 0.0f;
+    bool                     control_allow_forward = false;
+    std::string              control_distance_source = "none";
+    bool                     lidar_safety_valid = false;
+    float                    lidar_safety_distance_mm = 0.0f;
+    uint32_t                 lidar_candidate_count = 0;
     DepthDebugData           debug;
 };
 
@@ -245,6 +254,30 @@ struct TrackingConfig {
         float track_memory_timeout_sec = 3.0f;
     };
 
+    struct LidarConfig {
+        bool        enable = true;
+        std::string pointcloud_topic = "/lslidar_point_cloud";
+        std::string target_frame = "base_link";
+        float       min_x_m = 0.05f;
+        float       max_x_m = 3.0f;
+        float       min_y_m = -1.5f;
+        float       max_y_m = 1.5f;
+        float       min_z_m = -0.3f;
+        float       max_z_m = 1.8f;
+        float       horizontal_fov_rad = 1.2217f;
+        float       bearing_gate_base_rad = 0.20f;
+        float       bearing_gate_box_scale_rad = 0.70f;
+        float       range_gate_margin_m = 0.60f;
+        float       cluster_tolerance_m = 0.18f;
+        int         min_cluster_points = 3;
+        int         max_cluster_points = 200;
+        int         candidate_keep_count = 5;
+        float       safety_margin_m = 0.05f;
+        float       camera_lidar_consistency_margin_m = 0.35f;
+        bool        self_filter_enable = true;
+        std::string self_filter_node_name = "/scan_self_filter";
+    };
+
     bool  enable = true;
     float initial_center_gate_ratio = 0.3f;
     int   max_lost_frames = 10;
@@ -255,6 +288,7 @@ struct TrackingConfig {
     RecoveryConfig recovery;
     VisualServoConfig visual_servo;
     DebugConfig debug;
+    LidarConfig lidar;
 };
 
 struct GoalConfig {
@@ -495,6 +529,12 @@ struct DetectionCache {
     bool                              available = false;
 };
 
+struct PointCloudCache {
+    mutable std::mutex           mutex;
+    sensor_msgs::msg::PointCloud2 pointcloud;
+    bool                         available = false;
+};
+
 struct CostmapCache {
     mutable std::mutex      mutex;
     nav2_msgs::msg::Costmap costmap;
@@ -542,6 +582,35 @@ struct DepthControlDecision {
     bool              control_distance_valid = false;
     float             control_distance_m = std::numeric_limits<float>::infinity();
     bool              allow_forward_motion = false;
+    std::string       source = "none";
+    bool              lidar_safety_valid = false;
+    float             lidar_safety_distance_m = std::numeric_limits<float>::infinity();
+    uint32_t          lidar_candidate_count = 0;
+};
+
+struct LidarSafetyEstimate {
+    bool     valid = false;
+    float    safety_distance_m = std::numeric_limits<float>::infinity();
+    uint32_t candidate_count = 0;
+};
+
+struct LidarGateGeometry {
+    bool  valid = false;
+    float bearing_center_rad = 0.0f;
+    float bearing_gate_half_rad = 0.0f;
+    bool  have_expected_range = false;
+    float expected_range_m = std::numeric_limits<float>::infinity();
+    float range_gate_min_m = 0.0f;
+    float range_gate_max_m = 0.0f;
+};
+
+struct LidarSelfFilterBounds {
+    bool        valid = false;
+    float       x_min_m = 0.0f;
+    float       x_max_m = 0.0f;
+    float       y_min_m = 0.0f;
+    float       y_max_m = 0.0f;
+    rclcpp::Time stamp{0, 0, RCL_ROS_TIME};
 };
 
 struct RecoveryRotationState {
@@ -607,6 +676,7 @@ struct LCVision::Impl {
     void resetDetectorState();
     void storeColorFrame(const astra::ColorFrame &frame);
     void storeDepthFrame(const astra::DepthFrame &frame);
+    void storePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
     void updateDetectionCache(
         std::vector<DetectionDepthResult> detections, int width, int height, int64_t frame_index,
         const rclcpp::Time &stamp);
@@ -615,6 +685,7 @@ struct LCVision::Impl {
         std::vector<int16_t> &depth_data, int &width, int &height, int64_t &frame_index, rclcpp::Time &stamp);
     bool copyLatestRgbFrame(
         std::vector<uint8_t> &rgb_data, int &width, int &height, int64_t &frame_index, rclcpp::Time &stamp);
+    bool copyLatestPointCloud(sensor_msgs::msg::PointCloud2 &pointcloud) const;
     [[nodiscard]] bool isHistogramDebugVideoEnabled() const;
     [[nodiscard]] bool isPeakMaskDebugVideoEnabled() const;
     void rotateRgbFrame(std::vector<uint8_t> &rgb_data, int &width, int &height) const;
@@ -640,10 +711,15 @@ struct LCVision::Impl {
         const DetectionDepthResult &result, int32_t track_id, const rclcpp::Time &stamp);
     void assignTrackIds(std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
     void handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg);
+    LidarGateGeometry buildLidarGateGeometry(const DetectionDepthResult &result, int image_width) const;
+    void refreshLidarSelfFilterBounds(const rclcpp::Time &stamp) const;
+    LidarSelfFilterBounds getLidarSelfFilterBounds(const rclcpp::Time &stamp) const;
+    LidarSafetyEstimate estimateLidarSafetyForDetection(
+        const DetectionDepthResult &result, int image_width, const rclcpp::Time &stamp) const;
     DepthQualityState evaluateSelectedTargetDepthQuality(
         const DetectionDepthResult &result, const rclcpp::Time &stamp) const;
     DepthControlDecision buildDepthControlDecision(
-        const DetectionDepthResult &result, DepthQualityState quality_state, const rclcpp::Time &stamp) const;
+        const DetectionDepthResult &result, DepthQualityState quality_state, int image_width, const rclcpp::Time &stamp) const;
     void rememberTargetObservation(
         const DetectionDepthResult &result, int width, const rclcpp::Time &stamp,
         const std::optional<geometry_msgs::msg::PointStamped> &map_point = std::nullopt);
@@ -739,6 +815,9 @@ struct LCVision::Impl {
     FrameBuffer<uint8_t> depth_peak_mask_buffer;
     DetectionCache       detection_cache;
     CostmapCache         costmap_cache;
+    PointCloudCache      pointcloud_cache;
+    mutable std::mutex   lidar_self_filter_mutex;
+    mutable LidarSelfFilterBounds lidar_self_filter_bounds;
 
     VideoEncoder rgb_encoder;
     VideoEncoder depth_encoder;
@@ -761,7 +840,9 @@ struct LCVision::Impl {
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_map_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr selected_goal_pose_pub;
     rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr         costmap_sub;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr   lidar_pointcloud_sub;
     rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub;
+    rclcpp::AsyncParametersClient::SharedPtr lidar_self_filter_param_client;
 
     std::thread capture_thread;
     std::thread publish_thread;

@@ -16,7 +16,12 @@ std::string summarizeDetectionResult(const DetectionDepthResult &result) {
            << " nearest_valid_depth_mm=" << result.nearest_valid_depth_mm << " peak_px=" << result.peak_pixel_count
            << " depth_quality=" << static_cast<int>(result.depth_quality_state)
            << " control_distance_valid=" << (result.control_distance_valid ? "true" : "false")
-           << " control_distance_mm=" << result.control_distance_mm << " camera_valid="
+           << " control_distance_mm=" << result.control_distance_mm
+           << " control_allow_forward=" << (result.control_allow_forward ? "true" : "false")
+           << " control_source=" << result.control_distance_source
+           << " lidar_safety_valid=" << (result.lidar_safety_valid ? "true" : "false")
+           << " lidar_safety_distance_mm=" << result.lidar_safety_distance_mm
+           << " lidar_candidate_count=" << result.lidar_candidate_count << " camera_valid="
            << (result.camera_point_valid ? "true" : "false") << " camera_point=["
            << result.camera_point.x << "," << result.camera_point.y << "," << result.camera_point.z << "] track_id="
            << result.track_id << " selected=" << (result.selected ? "true" : "false");
@@ -166,6 +171,114 @@ double LCVision::Impl::angleDifferenceRad(const double lhs, const double rhs) {
 
 int32_t LCVision::Impl::allocateTrackId() {
     return tracked_target.next_track_id++;
+}
+
+LidarGateGeometry LCVision::Impl::buildLidarGateGeometry(
+    const DetectionDepthResult &result, const int image_width) const {
+    LidarGateGeometry geometry;
+    if (!tracking.lidar.enable || image_width <= 0) {
+        return geometry;
+    }
+
+    const float image_center_x = static_cast<float>(image_width) * 0.5f;
+    const float normalized_offset =
+        (detectionCenter(result).x - image_center_x) / std::max(1.0f, image_center_x);
+    geometry.bearing_center_rad =
+        -normalized_offset * static_cast<float>(tracking.lidar.horizontal_fov_rad) * 0.5f;
+
+    const float box_ratio = std::clamp(
+        static_cast<float>(result.detection.box.width) / static_cast<float>(std::max(1, image_width)), 0.0f, 1.0f);
+    geometry.bearing_gate_half_rad =
+        std::max(0.02f, tracking.lidar.bearing_gate_base_rad + box_ratio * tracking.lidar.bearing_gate_box_scale_rad);
+
+    geometry.have_expected_range =
+        remembered_target.control_distance_valid && std::isfinite(remembered_target.control_distance_m);
+    geometry.expected_range_m =
+        geometry.have_expected_range ? remembered_target.control_distance_m : std::numeric_limits<float>::infinity();
+
+    const float lateral_limit_m =
+        std::max(std::abs(tracking.lidar.min_y_m), std::abs(tracking.lidar.max_y_m));
+    const float range_limit_m =
+        std::hypot(std::max(std::abs(tracking.lidar.min_x_m), std::abs(tracking.lidar.max_x_m)), lateral_limit_m);
+    geometry.range_gate_min_m = std::max(0.0f, tracking.lidar.min_x_m);
+    geometry.range_gate_max_m = range_limit_m;
+
+    if (geometry.have_expected_range) {
+        geometry.range_gate_min_m =
+            std::max(geometry.range_gate_min_m, geometry.expected_range_m - tracking.lidar.range_gate_margin_m);
+        geometry.range_gate_max_m =
+            std::min(geometry.range_gate_max_m, geometry.expected_range_m + tracking.lidar.range_gate_margin_m);
+    }
+
+    geometry.valid = geometry.range_gate_max_m > geometry.range_gate_min_m;
+    return geometry;
+}
+
+void LCVision::Impl::refreshLidarSelfFilterBounds(const rclcpp::Time &stamp) const {
+    if (!tracking.lidar.self_filter_enable || lidar_self_filter_param_client == nullptr) {
+        std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+        lidar_self_filter_bounds.valid = false;
+        lidar_self_filter_bounds.stamp = stamp;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+        if (lidar_self_filter_bounds.stamp.nanoseconds() > 0 &&
+            (stamp - lidar_self_filter_bounds.stamp).seconds() < 1.0) {
+            return;
+        }
+        lidar_self_filter_bounds.stamp = stamp;
+    }
+
+    if (!lidar_self_filter_param_client->service_is_ready()) {
+        std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+        lidar_self_filter_bounds.valid = false;
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 5000,
+            "Lidar self-filter parameter service for %s is not ready yet",
+            tracking.lidar.self_filter_node_name.c_str());
+        return;
+    }
+
+    auto future = lidar_self_filter_param_client->get_parameters({"x_min", "x_max", "y_min", "y_max"});
+    if (future.wait_for(80ms) != std::future_status::ready) {
+        std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+        lidar_self_filter_bounds.valid = false;
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 5000,
+            "Timed out while reading lidar self-filter bounds from %s",
+            tracking.lidar.self_filter_node_name.c_str());
+        return;
+    }
+
+    const auto parameters = future.get();
+    if (parameters.size() != 4) {
+        std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+        lidar_self_filter_bounds.valid = false;
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 5000,
+            "Incomplete lidar self-filter bounds received from %s",
+            tracking.lidar.self_filter_node_name.c_str());
+        return;
+    }
+
+    LidarSelfFilterBounds bounds;
+    bounds.valid = true;
+    bounds.x_min_m = static_cast<float>(parameters[0].as_double());
+    bounds.x_max_m = static_cast<float>(parameters[1].as_double());
+    bounds.y_min_m = static_cast<float>(parameters[2].as_double());
+    bounds.y_max_m = static_cast<float>(parameters[3].as_double());
+    bounds.stamp = stamp;
+
+    std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+    lidar_self_filter_bounds = bounds;
+}
+
+LidarSelfFilterBounds LCVision::Impl::getLidarSelfFilterBounds(const rclcpp::Time &stamp) const {
+    refreshLidarSelfFilterBounds(stamp);
+    std::lock_guard<std::mutex> lock(lidar_self_filter_mutex);
+    return lidar_self_filter_bounds;
 }
 
 void LCVision::Impl::upsertTrackMemory(
@@ -335,6 +448,169 @@ void LCVision::Impl::handleNavigateToPoseStatus(const action_msgs::msg::GoalStat
     external_navigation_active.store(saw_external_active_goal, std::memory_order_relaxed);
 }
 
+LidarSafetyEstimate LCVision::Impl::estimateLidarSafetyForDetection(
+    const DetectionDepthResult &result, const int image_width, const rclcpp::Time &stamp) const {
+    LidarSafetyEstimate estimate;
+    if (!tracking.lidar.enable || image_width <= 0) {
+        return estimate;
+    }
+    const auto gate_geometry = buildLidarGateGeometry(result, image_width);
+    if (!gate_geometry.valid) {
+        return estimate;
+    }
+    const auto self_filter_bounds = getLidarSelfFilterBounds(stamp);
+
+    sensor_msgs::msg::PointCloud2 pointcloud;
+    if (!copyLatestPointCloud(pointcloud)) {
+        return estimate;
+    }
+
+    geometry_msgs::msg::TransformStamped transform_msg;
+    try {
+        if (pointcloud.header.frame_id != tracking.lidar.target_frame) {
+            transform_msg = tf_buffer->lookupTransform(
+                tracking.lidar.target_frame, pointcloud.header.frame_id, tf2::TimePointZero);
+        }
+    } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000, "Failed to transform lidar point cloud from %s to %s: %s",
+            pointcloud.header.frame_id.c_str(), tracking.lidar.target_frame.c_str(), ex.what());
+        return estimate;
+    }
+
+    tf2::Transform cloud_transform;
+    if (pointcloud.header.frame_id != tracking.lidar.target_frame) {
+        tf2::fromMsg(transform_msg.transform, cloud_transform);
+    }
+
+    struct LidarPoint {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float range_m = std::numeric_limits<float>::infinity();
+    };
+
+    std::vector<LidarPoint> filtered_points;
+    try {
+        sensor_msgs::PointCloud2ConstIterator<float> iter_x(pointcloud, "x");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_y(pointcloud, "y");
+        sensor_msgs::PointCloud2ConstIterator<float> iter_z(pointcloud, "z");
+
+        for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
+            float x = *iter_x;
+            float y = *iter_y;
+            float z = *iter_z;
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                continue;
+            }
+
+            if (pointcloud.header.frame_id != tracking.lidar.target_frame) {
+                const tf2::Vector3 input(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
+                const tf2::Vector3 transformed = cloud_transform * input;
+                x = static_cast<float>(transformed.x());
+                y = static_cast<float>(transformed.y());
+                z = static_cast<float>(transformed.z());
+            }
+
+            if (x < tracking.lidar.min_x_m || x > tracking.lidar.max_x_m || y < tracking.lidar.min_y_m ||
+                y > tracking.lidar.max_y_m || z < tracking.lidar.min_z_m || z > tracking.lidar.max_z_m) {
+                continue;
+            }
+            if (self_filter_bounds.valid && x >= self_filter_bounds.x_min_m && x <= self_filter_bounds.x_max_m &&
+                y >= self_filter_bounds.y_min_m && y <= self_filter_bounds.y_max_m) {
+                continue;
+            }
+
+            const float range_m = std::hypot(x, y);
+            const float bearing_rad = std::atan2(y, x);
+            const float bearing_delta =
+                static_cast<float>(std::abs(angleDifferenceRad(bearing_rad, gate_geometry.bearing_center_rad)));
+            if (bearing_delta > gate_geometry.bearing_gate_half_rad) {
+                continue;
+            }
+
+            if (range_m < gate_geometry.range_gate_min_m || range_m > gate_geometry.range_gate_max_m) {
+                continue;
+            }
+
+            filtered_points.push_back(LidarPoint{x, y, z, range_m});
+        }
+    } catch (const std::exception &ex) {
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000, "Failed to iterate lidar point cloud fields: %s", ex.what());
+        return estimate;
+    }
+
+    if (filtered_points.empty()) {
+        return estimate;
+    }
+
+    struct ClusterCandidate {
+        float min_range_m = std::numeric_limits<float>::infinity();
+        int   point_count = 0;
+    };
+
+    std::vector<ClusterCandidate> candidates;
+    std::vector<bool> visited(filtered_points.size(), false);
+    const float cluster_tolerance_sq = tracking.lidar.cluster_tolerance_m * tracking.lidar.cluster_tolerance_m;
+    for (size_t i = 0; i < filtered_points.size(); ++i) {
+        if (visited[i]) {
+            continue;
+        }
+
+        std::vector<size_t> queue{ i };
+        visited[i] = true;
+        ClusterCandidate candidate;
+        for (size_t queue_index = 0; queue_index < queue.size(); ++queue_index) {
+            const size_t point_index = queue[queue_index];
+            const auto &point = filtered_points[point_index];
+            candidate.min_range_m = std::min(candidate.min_range_m, point.range_m);
+            ++candidate.point_count;
+
+            for (size_t neighbor_index = 0; neighbor_index < filtered_points.size(); ++neighbor_index) {
+                if (visited[neighbor_index]) {
+                    continue;
+                }
+                const float dx = filtered_points[neighbor_index].x - point.x;
+                const float dy = filtered_points[neighbor_index].y - point.y;
+                if ((dx * dx) + (dy * dy) > cluster_tolerance_sq) {
+                    continue;
+                }
+                visited[neighbor_index] = true;
+                queue.push_back(neighbor_index);
+            }
+        }
+
+        if (candidate.point_count < std::max(1, tracking.lidar.min_cluster_points) ||
+            candidate.point_count > std::max(tracking.lidar.min_cluster_points, tracking.lidar.max_cluster_points)) {
+            continue;
+        }
+        candidates.push_back(candidate);
+    }
+
+    if (candidates.empty()) {
+        const auto nearest_point = std::min_element(
+            filtered_points.begin(), filtered_points.end(),
+            [](const LidarPoint &lhs, const LidarPoint &rhs) { return lhs.range_m < rhs.range_m; });
+        if (nearest_point == filtered_points.end()) {
+            return estimate;
+        }
+        estimate.valid = true;
+        estimate.candidate_count = 1;
+        estimate.safety_distance_m = std::max(0.0f, nearest_point->range_m - tracking.lidar.safety_margin_m);
+        return estimate;
+    }
+
+    std::sort(candidates.begin(), candidates.end(), [](const ClusterCandidate &lhs, const ClusterCandidate &rhs) {
+        return lhs.min_range_m < rhs.min_range_m;
+    });
+    const auto keep_count = static_cast<size_t>(std::max(1, tracking.lidar.candidate_keep_count));
+    estimate.candidate_count = static_cast<uint32_t>(std::min(keep_count, candidates.size()));
+    estimate.valid = true;
+    estimate.safety_distance_m = std::max(0.0f, candidates.front().min_range_m - tracking.lidar.safety_margin_m);
+    return estimate;
+}
+
 DepthQualityState LCVision::Impl::evaluateSelectedTargetDepthQuality(
     const DetectionDepthResult &result, const rclcpp::Time &stamp) const {
     if (!result.depth_valid) {
@@ -385,9 +661,13 @@ DepthQualityState LCVision::Impl::evaluateSelectedTargetDepthQuality(
 }
 
 DepthControlDecision LCVision::Impl::buildDepthControlDecision(
-    const DetectionDepthResult &result, const DepthQualityState quality_state, const rclcpp::Time &stamp) const {
+    const DetectionDepthResult &result, const DepthQualityState quality_state, const int image_width, const rclcpp::Time &stamp) const {
     DepthControlDecision decision;
     decision.quality_state = quality_state;
+    const auto lidar_estimate = estimateLidarSafetyForDetection(result, image_width, stamp);
+    decision.lidar_safety_valid = lidar_estimate.valid;
+    decision.lidar_safety_distance_m = lidar_estimate.safety_distance_m;
+    decision.lidar_candidate_count = lidar_estimate.candidate_count;
 
     switch (quality_state) {
     case DepthQualityState::Reliable:
@@ -395,24 +675,31 @@ DepthControlDecision LCVision::Impl::buildDepthControlDecision(
             decision.control_distance_valid = true;
             decision.control_distance_m = result.depth_mm / 1000.0f;
             decision.allow_forward_motion = true;
+            decision.source = "camera";
+            if (lidar_estimate.valid) {
+                decision.control_distance_m = std::min(decision.control_distance_m, lidar_estimate.safety_distance_m);
+                decision.source = "camera_lidar_min";
+            }
         }
         return decision;
     case DepthQualityState::NearFieldOccluded:
     case DepthQualityState::BackgroundSuspect: {
-        const bool have_recent_reliable_depth =
-            remembered_target.reliable_depth_available &&
-            (stamp - remembered_target.reliable_depth_stamp).seconds() <=
-                static_cast<double>(std::max(0.0f, depth.estimation.near_field_history_timeout_sec));
-        if (!have_recent_reliable_depth) {
+        if (!lidar_estimate.valid) {
             return decision;
         }
         decision.control_distance_valid = true;
-        decision.control_distance_m =
-            std::min(remembered_target.reliable_depth_m, std::max(0.0f, goal.standoff_distance_m));
-        decision.allow_forward_motion = false;
+        decision.control_distance_m = lidar_estimate.safety_distance_m;
+        decision.allow_forward_motion = true;
+        decision.source = "lidar_conservative";
         return decision;
     }
     case DepthQualityState::Invalid:
+        if (lidar_estimate.valid) {
+            decision.control_distance_valid = true;
+            decision.control_distance_m = lidar_estimate.safety_distance_m;
+            decision.allow_forward_motion = true;
+            decision.source = "lidar_conservative";
+        }
         return decision;
     }
     return decision;
@@ -470,6 +757,10 @@ void LCVision::Impl::publishSelectedTargetStatus(
         msg.camera_depth_mm = result.depth_mm;
         msg.control_distance_valid = result.control_distance_valid;
         msg.control_distance_mm = result.control_distance_mm;
+        msg.control_distance_source = result.control_distance_source;
+        msg.lidar_safety_valid = result.lidar_safety_valid;
+        msg.lidar_safety_distance_mm = result.lidar_safety_distance_mm;
+        msg.lidar_candidate_count = result.lidar_candidate_count;
         msg.roi_invalid_ratio = result.roi_invalid_ratio;
         msg.roi_valid_pixel_count = result.roi_valid_pixel_count;
         msg.roi_invalid_pixel_count = result.roi_invalid_pixel_count;
@@ -544,10 +835,10 @@ void LCVision::Impl::markRecoveryTargetReacquired(
     recovery_rotation.reacquired_stamp = stamp;
     RCLCPP_INFO(
         node.get_logger(),
-        "Recovery target reacquired: direction=%d phase=%s offset_px=%.3f depth_m=%.3f waiting_for_alignment_before_stop=true",
+        "Recovery target reacquired: direction=%d phase=%s offset_px=%.3f control_distance_m=%.3f waiting_for_alignment_before_stop=true",
         recovery_rotation.direction, toString(recovery_rotation.phase),
         static_cast<double>(detectionCenter(selected).x - static_cast<float>(width) * 0.5f),
-        static_cast<double>(selected.depth_mm / 1000.0f));
+        static_cast<double>(selected.control_distance_valid ? selected.control_distance_mm / 1000.0f : 0.0f));
 }
 
 bool LCVision::Impl::shouldKeepVisualServo(const rclcpp::Time &stamp) const {
@@ -633,7 +924,7 @@ bool LCVision::Impl::maybeRunVisualServo(
     double linear_velocity = 0.0;
     const double distance_error_m =
         static_cast<double>(target_distance_m) - static_cast<double>(goal.standoff_distance_m);
-    if (selected.depth_quality_state == DepthQualityState::Reliable && distance_error_m > 0.0 && aligned_for_forward) {
+    if (selected.control_allow_forward && distance_error_m > 0.0 && aligned_for_forward) {
         linear_velocity = std::clamp(
             distance_error_m * static_cast<double>(tracking.visual_servo.linear_gain),
             static_cast<double>(tracking.visual_servo.min_linear_speed_m_s),
@@ -655,11 +946,12 @@ bool LCVision::Impl::maybeRunVisualServo(
         RCLCPP_INFO(
             node.get_logger(),
             "Visual servo command: offset_px=%.3f normalized_error=%.3f aligned_for_forward=%s linear=%.3f angular=%.3f "
-            "depth_quality=%s control_distance_m=%.3f recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
+            "depth_quality=%s control_distance_m=%.3f control_source=%s recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
             static_cast<double>(offset_px), static_cast<double>(normalized_error),
             aligned_for_forward ? "true" : "false", linear_velocity, angular_velocity,
             toString(selected.depth_quality_state), static_cast<double>(target_distance_m),
-            toString(recovery_rotation.phase), recovery_rotation.direction, allow_recovery_stop ? "true" : "false");
+            selected.control_distance_source.c_str(), toString(recovery_rotation.phase), recovery_rotation.direction,
+            allow_recovery_stop ? "true" : "false");
     }
     return true;
 }
@@ -803,7 +1095,7 @@ void LCVision::Impl::maybeRecoverLostTarget(
 
     bool has_visible_candidate = false;
     for (const auto &result : results) {
-        if (result.depth_valid && result.camera_point_valid) {
+        if (result.depth_valid || result.control_distance_valid || result.detection.score > 0.0f) {
             has_visible_candidate = true;
             break;
         }
@@ -864,9 +1156,7 @@ int LCVision::Impl::selectTrackedDetection(
     std::vector<int> candidates;
     candidates.reserve(results.size());
     for (size_t i = 0; i < results.size(); ++i) {
-        if (results[i].depth_valid && results[i].camera_point_valid) {
-            candidates.push_back(static_cast<int>(i));
-        }
+        candidates.push_back(static_cast<int>(i));
     }
 
     if (tracking.debug.enable_verbose_logs) {
@@ -887,7 +1177,7 @@ int LCVision::Impl::selectTrackedDetection(
         if (tracking.debug.enable_verbose_logs) {
             RCLCPP_INFO(
                 node.get_logger(),
-                "Tracking found no valid depth candidates. tracked_active=%s tracked_id=%d lost_frames=%d max_lost_frames=%d",
+                "Tracking found no visual candidates. tracked_active=%s tracked_id=%d lost_frames=%d max_lost_frames=%d",
                 tracked_target.active ? "true" : "false", tracked_target.current_track_id, tracked_target.lost_frames,
                 tracking.max_lost_frames);
         }
@@ -1289,72 +1579,179 @@ void LCVision::Impl::publishGoalDebugMarkers(
     marker_array.markers.push_back(clear_marker);
 
     int marker_id = 0;
+    const float marker_alpha = std::clamp(goal.debug_marker.alpha, 0.0f, 1.0f);
+    const auto self_filter_bounds = getLidarSelfFilterBounds(stamp);
     for (const auto &result : results) {
-        if (!result.camera_point_valid) {
-            continue;
-        }
-
-        geometry_msgs::msg::PointStamped camera_point;
-        camera_point.header.stamp = toBuiltinTime(stamp);
-        camera_point.header.frame_id = depth.frame_id;
-        camera_point.point = result.camera_point;
-
-        geometry_msgs::msg::PointStamped map_point;
-        if (!transformPointToFrame(camera_point, goal.debug_marker.frame_id, map_point)) {
-            continue;
-        }
-
         const bool is_selected = result.selected;
-        const float alpha = std::clamp(goal.debug_marker.alpha, 0.0f, 1.0f);
-
-        visualization_msgs::msg::Marker point_marker;
-        point_marker.header.stamp = toBuiltinTime(stamp);
-        point_marker.header.frame_id = goal.debug_marker.frame_id;
-        point_marker.ns = "goal_debug_points";
-        point_marker.id = marker_id++;
-        point_marker.type = visualization_msgs::msg::Marker::SPHERE;
-        point_marker.action = visualization_msgs::msg::Marker::ADD;
-        point_marker.pose.position = map_point.point;
-        point_marker.pose.position.z = goal.debug_marker.z;
-        point_marker.pose.orientation.w = 1.0;
-        point_marker.scale.x = std::max(1.0e-3f, goal.debug_marker.point_scale);
-        point_marker.scale.y = std::max(1.0e-3f, goal.debug_marker.point_scale);
-        point_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.point_scale);
-        point_marker.color.r = is_selected ? 0.95f : 0.15f;
-        point_marker.color.g = is_selected ? 0.35f : 0.85f;
-        point_marker.color.b = is_selected ? 0.20f : 0.95f;
-        point_marker.color.a = alpha;
-        marker_array.markers.push_back(std::move(point_marker));
-
-        visualization_msgs::msg::Marker text_marker;
-        text_marker.header.stamp = toBuiltinTime(stamp);
-        text_marker.header.frame_id = goal.debug_marker.frame_id;
-        text_marker.ns = "goal_debug_labels";
-        text_marker.id = marker_id++;
-        text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-        text_marker.action = visualization_msgs::msg::Marker::ADD;
-        text_marker.pose.position = map_point.point;
-        text_marker.pose.position.z = goal.debug_marker.z + goal.debug_marker.text_z_offset;
-        text_marker.pose.orientation.w = 1.0;
-        text_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.text_scale);
-        text_marker.color.r = 1.0f;
-        text_marker.color.g = 1.0f;
-        text_marker.color.b = 1.0f;
-        text_marker.color.a = alpha;
-
-        const double distance_m = static_cast<double>(result.depth_mm) / 1000.0;
-        std::ostringstream label_stream;
-        label_stream.setf(std::ios::fixed);
-        label_stream.precision(2);
-        label_stream << result.detection.label << " " << distance_m << "m";
-        if (result.track_id >= 0) {
-            label_stream << " id=" << result.track_id;
+        geometry_msgs::msg::PointStamped map_point;
+        bool have_map_point = false;
+        if (result.camera_point_valid) {
+            geometry_msgs::msg::PointStamped camera_point;
+            camera_point.header.stamp = toBuiltinTime(stamp);
+            camera_point.header.frame_id = depth.frame_id;
+            camera_point.point = result.camera_point;
+            have_map_point = transformPointToFrame(camera_point, goal.debug_marker.frame_id, map_point);
         }
-        if (is_selected) {
-            label_stream << " selected";
+
+        if (have_map_point) {
+            visualization_msgs::msg::Marker point_marker;
+            point_marker.header.stamp = toBuiltinTime(stamp);
+            point_marker.header.frame_id = goal.debug_marker.frame_id;
+            point_marker.ns = "goal_debug_points";
+            point_marker.id = marker_id++;
+            point_marker.type = visualization_msgs::msg::Marker::SPHERE;
+            point_marker.action = visualization_msgs::msg::Marker::ADD;
+            point_marker.pose.position = map_point.point;
+            point_marker.pose.position.z = goal.debug_marker.z;
+            point_marker.pose.orientation.w = 1.0;
+            point_marker.scale.x = std::max(1.0e-3f, goal.debug_marker.point_scale);
+            point_marker.scale.y = std::max(1.0e-3f, goal.debug_marker.point_scale);
+            point_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.point_scale);
+            point_marker.color.r = is_selected ? 0.95f : 0.15f;
+            point_marker.color.g = is_selected ? 0.35f : 0.85f;
+            point_marker.color.b = is_selected ? 0.20f : 0.95f;
+            point_marker.color.a = marker_alpha;
+            marker_array.markers.push_back(std::move(point_marker));
+
+            visualization_msgs::msg::Marker text_marker;
+            text_marker.header.stamp = toBuiltinTime(stamp);
+            text_marker.header.frame_id = goal.debug_marker.frame_id;
+            text_marker.ns = "goal_debug_labels";
+            text_marker.id = marker_id++;
+            text_marker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            text_marker.action = visualization_msgs::msg::Marker::ADD;
+            text_marker.pose.position = map_point.point;
+            text_marker.pose.position.z = goal.debug_marker.z + goal.debug_marker.text_z_offset;
+            text_marker.pose.orientation.w = 1.0;
+            text_marker.scale.z = std::max(1.0e-3f, goal.debug_marker.text_scale);
+            text_marker.color.r = 1.0f;
+            text_marker.color.g = 1.0f;
+            text_marker.color.b = 1.0f;
+            text_marker.color.a = marker_alpha;
+
+            const double distance_m = static_cast<double>(result.depth_mm) / 1000.0;
+            std::ostringstream label_stream;
+            label_stream.setf(std::ios::fixed);
+            label_stream.precision(2);
+            label_stream << result.detection.label << " " << distance_m << "m";
+            if (result.track_id >= 0) {
+                label_stream << " id=" << result.track_id;
+            }
+            if (is_selected) {
+                label_stream << " selected";
+            }
+            text_marker.text = label_stream.str();
+            marker_array.markers.push_back(std::move(text_marker));
         }
-        text_marker.text = label_stream.str();
-        marker_array.markers.push_back(std::move(text_marker));
+
+        if (!tracking.lidar.enable) {
+            continue;
+        }
+
+        const auto gate_geometry = buildLidarGateGeometry(result, std::max(1, rgb.width));
+        if (!gate_geometry.valid) {
+            continue;
+        }
+
+        std::vector<geometry_msgs::msg::Point> gate_points;
+        const auto append_lidar_point = [&](const float x, const float y, const float z) {
+            geometry_msgs::msg::PointStamped lidar_point;
+            lidar_point.header.stamp = toBuiltinTime(stamp);
+            lidar_point.header.frame_id = tracking.lidar.target_frame;
+            lidar_point.point.x = x;
+            lidar_point.point.y = y;
+            lidar_point.point.z = z;
+
+            geometry_msgs::msg::PointStamped marker_point;
+            if (!transformPointToFrame(lidar_point, goal.debug_marker.frame_id, marker_point)) {
+                return;
+            }
+            marker_point.point.z = goal.debug_marker.z + (is_selected ? 0.01f : 0.0f);
+            gate_points.push_back(marker_point.point);
+        };
+
+        const int gate_segments = 20;
+        for (int i = 0; i <= gate_segments; ++i) {
+            const float ratio = static_cast<float>(i) / static_cast<float>(gate_segments);
+            const float angle = gate_geometry.bearing_center_rad - gate_geometry.bearing_gate_half_rad +
+                                ratio * gate_geometry.bearing_gate_half_rad * 2.0f;
+            append_lidar_point(
+                gate_geometry.range_gate_max_m * std::cos(angle),
+                gate_geometry.range_gate_max_m * std::sin(angle), 0.0f);
+        }
+        for (int i = gate_segments; i >= 0; --i) {
+            const float ratio = static_cast<float>(i) / static_cast<float>(gate_segments);
+            const float angle = gate_geometry.bearing_center_rad - gate_geometry.bearing_gate_half_rad +
+                                ratio * gate_geometry.bearing_gate_half_rad * 2.0f;
+            append_lidar_point(
+                gate_geometry.range_gate_min_m * std::cos(angle),
+                gate_geometry.range_gate_min_m * std::sin(angle), 0.0f);
+        }
+        if (!gate_points.empty()) {
+            gate_points.push_back(gate_points.front());
+        }
+
+        if (gate_points.size() >= 4) {
+            visualization_msgs::msg::Marker gate_marker;
+            gate_marker.header.stamp = toBuiltinTime(stamp);
+            gate_marker.header.frame_id = goal.debug_marker.frame_id;
+            gate_marker.ns = is_selected ? "goal_debug_lidar_gate_selected" : "goal_debug_lidar_gate";
+            gate_marker.id = marker_id++;
+            gate_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+            gate_marker.action = visualization_msgs::msg::Marker::ADD;
+            gate_marker.pose.orientation.w = 1.0;
+            gate_marker.scale.x = std::max(0.01f, goal.debug_marker.point_scale * 0.18f);
+            gate_marker.color.r = is_selected ? 1.0f : 0.9f;
+            gate_marker.color.g = is_selected ? 0.75f : 0.65f;
+            gate_marker.color.b = is_selected ? 0.15f : 0.25f;
+            gate_marker.color.a =
+                is_selected ? std::min(1.0f, marker_alpha) : std::min(0.55f, marker_alpha * 0.7f);
+            gate_marker.points = std::move(gate_points);
+            marker_array.markers.push_back(std::move(gate_marker));
+        }
+    }
+
+    if (tracking.lidar.enable && self_filter_bounds.valid) {
+        std::vector<geometry_msgs::msg::Point> box_points;
+        const auto append_box_corner = [&](const float x, const float y) {
+            geometry_msgs::msg::PointStamped lidar_point;
+            lidar_point.header.stamp = toBuiltinTime(stamp);
+            lidar_point.header.frame_id = tracking.lidar.target_frame;
+            lidar_point.point.x = x;
+            lidar_point.point.y = y;
+            lidar_point.point.z = 0.0f;
+
+            geometry_msgs::msg::PointStamped marker_point;
+            if (!transformPointToFrame(lidar_point, goal.debug_marker.frame_id, marker_point)) {
+                return;
+            }
+            marker_point.point.z = goal.debug_marker.z + 0.02f;
+            box_points.push_back(marker_point.point);
+        };
+
+        append_box_corner(self_filter_bounds.x_min_m, self_filter_bounds.y_min_m);
+        append_box_corner(self_filter_bounds.x_max_m, self_filter_bounds.y_min_m);
+        append_box_corner(self_filter_bounds.x_max_m, self_filter_bounds.y_max_m);
+        append_box_corner(self_filter_bounds.x_min_m, self_filter_bounds.y_max_m);
+        append_box_corner(self_filter_bounds.x_min_m, self_filter_bounds.y_min_m);
+
+        if (box_points.size() >= 5) {
+            visualization_msgs::msg::Marker self_filter_marker;
+            self_filter_marker.header.stamp = toBuiltinTime(stamp);
+            self_filter_marker.header.frame_id = goal.debug_marker.frame_id;
+            self_filter_marker.ns = "goal_debug_lidar_self_filter";
+            self_filter_marker.id = marker_id++;
+            self_filter_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
+            self_filter_marker.action = visualization_msgs::msg::Marker::ADD;
+            self_filter_marker.pose.orientation.w = 1.0;
+            self_filter_marker.scale.x = std::max(0.008f, goal.debug_marker.point_scale * 0.12f);
+            self_filter_marker.color.r = 0.95f;
+            self_filter_marker.color.g = 0.15f;
+            self_filter_marker.color.b = 0.15f;
+            self_filter_marker.color.a = std::min(0.8f, marker_alpha);
+            self_filter_marker.points = std::move(box_points);
+            marker_array.markers.push_back(std::move(self_filter_marker));
+        }
     }
 
     goal_debug_marker_pub->publish(marker_array);
@@ -1385,13 +1782,24 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
 
     auto &selected = results[static_cast<size_t>(selected_index)];
     selected.depth_quality_state = evaluateSelectedTargetDepthQuality(selected, stamp);
-    const auto control_decision = buildDepthControlDecision(selected, selected.depth_quality_state, stamp);
+    const auto control_decision = buildDepthControlDecision(selected, selected.depth_quality_state, width, stamp);
     selected.control_distance_valid = control_decision.control_distance_valid;
     selected.control_distance_mm =
         control_decision.control_distance_valid ? control_decision.control_distance_m * 1000.0f : 0.0f;
+    selected.control_allow_forward = control_decision.allow_forward_motion;
+    selected.control_distance_source = control_decision.source;
+    selected.lidar_safety_valid = control_decision.lidar_safety_valid;
+    selected.lidar_safety_distance_mm =
+        control_decision.lidar_safety_valid ? control_decision.lidar_safety_distance_m * 1000.0f : 0.0f;
+    selected.lidar_candidate_count = control_decision.lidar_candidate_count;
     tracked_target.last_result.depth_quality_state = selected.depth_quality_state;
     tracked_target.last_result.control_distance_valid = selected.control_distance_valid;
     tracked_target.last_result.control_distance_mm = selected.control_distance_mm;
+    tracked_target.last_result.control_allow_forward = selected.control_allow_forward;
+    tracked_target.last_result.control_distance_source = selected.control_distance_source;
+    tracked_target.last_result.lidar_safety_valid = selected.lidar_safety_valid;
+    tracked_target.last_result.lidar_safety_distance_mm = selected.lidar_safety_distance_mm;
+    tracked_target.last_result.lidar_candidate_count = selected.lidar_candidate_count;
     rememberTargetObservation(selected, width, stamp);
     publishSelectedTargetStatus(std::optional<DetectionDepthResult>(selected), stamp);
     geometry_msgs::msg::PointStamped camera_point;

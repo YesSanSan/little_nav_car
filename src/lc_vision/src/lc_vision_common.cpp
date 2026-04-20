@@ -703,6 +703,16 @@ void LCVision::Impl::storeDepthFrame(const astra::DepthFrame &frame) {
     frame.copy_to(depth_buffer.data.data());
 }
 
+void LCVision::Impl::storePointCloud(const sensor_msgs::msg::PointCloud2::SharedPtr msg) {
+    if (msg == nullptr) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(pointcloud_cache.mutex);
+    pointcloud_cache.pointcloud = *msg;
+    pointcloud_cache.available = true;
+}
+
 void LCVision::Impl::updateDetectionCache(
     std::vector<DetectionDepthResult> detections, const int width, const int height, const int64_t frame_index,
     const rclcpp::Time &stamp) {
@@ -749,6 +759,16 @@ bool LCVision::Impl::copyLatestRgbFrame(
     frame_index = rgb_buffer.frame_index;
     stamp = rgb_buffer.stamp;
     return !rgb_data.empty() && width > 0 && height > 0;
+}
+
+bool LCVision::Impl::copyLatestPointCloud(sensor_msgs::msg::PointCloud2 &pointcloud) const {
+    std::lock_guard<std::mutex> lock(pointcloud_cache.mutex);
+    if (!pointcloud_cache.available) {
+        return false;
+    }
+
+    pointcloud = pointcloud_cache.pointcloud;
+    return pointcloud.width > 0U && pointcloud.height > 0U && !pointcloud.data.empty();
 }
 
 bool LCVision::Impl::isHistogramDebugVideoEnabled() const {
