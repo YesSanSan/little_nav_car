@@ -314,6 +314,10 @@ void LCVision::getParams() {
     impl_->tracking.initial_center_gate_ratio =
         static_cast<float>(this->declare_parameter<double>("tracking.initial_center_gate_ratio", 0.2));
     impl_->tracking.max_lost_frames = this->declare_parameter<int>("tracking.max_lost_frames", 10);
+    impl_->tracking.map_match.distance_tolerance_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.map_match.distance_tolerance_m", 0.6));
+    impl_->tracking.map_match.angle_tolerance_rad =
+        static_cast<float>(this->declare_parameter<double>("tracking.map_match.angle_tolerance_rad", 0.8));
     impl_->tracking.min_iou_for_match =
         static_cast<float>(this->declare_parameter<double>("tracking.min_iou_for_match", 0.05));
     impl_->tracking.max_center_distance_px =
@@ -325,12 +329,37 @@ void LCVision::getParams() {
         this->declare_parameter<std::string>("tracking.recovery.cmd_vel_topic", "/cmd_vel_nav");
     impl_->tracking.recovery.turn_speed_rad_s =
         static_cast<float>(this->declare_parameter<double>("tracking.recovery.turn_speed_rad_s", 0.8));
+    impl_->tracking.recovery.reacquire_turn_speed_rad_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.recovery.reacquire_turn_speed_rad_s", 0.25));
     impl_->tracking.recovery.lost_delay_sec =
         static_cast<float>(this->declare_parameter<double>("tracking.recovery.lost_delay_sec", 0.2));
     impl_->tracking.recovery.memory_timeout_sec =
         static_cast<float>(this->declare_parameter<double>("tracking.recovery.memory_timeout_sec", 5.0));
     impl_->tracking.recovery.search_timeout_sec =
         static_cast<float>(this->declare_parameter<double>("tracking.recovery.search_timeout_sec", 8.0));
+    impl_->tracking.visual_servo.enable = this->declare_parameter<bool>("tracking.visual_servo.enable", true);
+    impl_->tracking.visual_servo.engage_distance_m =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.engage_distance_m", 1.1));
+    impl_->tracking.visual_servo.lost_target_distance_m = static_cast<float>(
+        this->declare_parameter<double>("tracking.visual_servo.lost_target_distance_m", 1.8));
+    impl_->tracking.visual_servo.align_deadband_px =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.align_deadband_px", 36.0));
+    impl_->tracking.visual_servo.forward_deadband_px =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.forward_deadband_px", 20.0));
+    impl_->tracking.visual_servo.align_band_ratio =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.align_band_ratio", 0.2));
+    impl_->tracking.visual_servo.turn_gain =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.turn_gain", 0.9));
+    impl_->tracking.visual_servo.min_turn_speed_rad_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.min_turn_speed_rad_s", 0.15));
+    impl_->tracking.visual_servo.max_turn_speed_rad_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.max_turn_speed_rad_s", 0.45));
+    impl_->tracking.visual_servo.linear_gain =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.linear_gain", 0.45));
+    impl_->tracking.visual_servo.min_linear_speed_m_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.min_linear_speed_m_s", 0.08));
+    impl_->tracking.visual_servo.max_linear_speed_m_s =
+        static_cast<float>(this->declare_parameter<double>("tracking.visual_servo.max_linear_speed_m_s", 0.3));
 
     impl_->goal.enable = this->declare_parameter<bool>("goal.enable", true);
     impl_->goal.global_frame_id = this->declare_parameter<std::string>("goal.global_frame_id", "map");
@@ -404,11 +433,15 @@ void LCVision::getParams() {
         impl_->depth.camera_point.flip_x ? "true" : "false");
     RCLCPP_INFO(
         get_logger(),
-        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d min_iou=%.2f max_center=%.1f max_depth_delta=%.1f recovery=%s turn=%.2frad/s",
+        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d map_match=[dist=%.2fm angle=%.2frad] min_iou=%.2f max_center=%.1f max_depth_delta=%.1f recovery=%s turn=%.2frad/s reacquire=%.2frad/s visual_servo=%s engage=%.2fm lost=%.2fm",
         impl_->tracking.enable ? "true" : "false", impl_->tracking.initial_center_gate_ratio,
-        impl_->tracking.max_lost_frames, impl_->tracking.min_iou_for_match,
+        impl_->tracking.max_lost_frames, impl_->tracking.map_match.distance_tolerance_m,
+        impl_->tracking.map_match.angle_tolerance_rad, impl_->tracking.min_iou_for_match,
         impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm,
-        impl_->tracking.recovery.enable ? "true" : "false", impl_->tracking.recovery.turn_speed_rad_s);
+        impl_->tracking.recovery.enable ? "true" : "false", impl_->tracking.recovery.turn_speed_rad_s,
+        impl_->tracking.recovery.reacquire_turn_speed_rad_s,
+        impl_->tracking.visual_servo.enable ? "true" : "false", impl_->tracking.visual_servo.engage_distance_m,
+        impl_->tracking.visual_servo.lost_target_distance_m);
     RCLCPP_INFO(
         get_logger(),
         "Goal config: enable=%s global_frame=%s robot_frame=%s costmap=%s standoff=%.2fm max_target_distance=%.2fm stable_frames=%d clearance=%.2fm debug_marker=%s",
@@ -584,7 +617,7 @@ LCVision::handleRuntimeParameters(const std::vector<rclcpp::Parameter> &paramete
 
         if (!tracking_enabled || !goal_enabled) {
             cancelCurrentNavigationGoal("vision tracking disabled");
-            impl_->stopRecoveryRotation("vision tracking disabled");
+            impl_->stopTrackingMotion("vision tracking disabled", true);
         }
     }
 

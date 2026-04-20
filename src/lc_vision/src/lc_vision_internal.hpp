@@ -182,13 +182,34 @@ struct DetectorConfig {
 };
 
 struct TrackingConfig {
+    struct MapMatchConfig {
+        float distance_tolerance_m = 0.6f;
+        float angle_tolerance_rad = 0.8f;
+    };
+
     struct RecoveryConfig {
         bool        enable = true;
         std::string cmd_vel_topic = "/cmd_vel_nav";
         float       turn_speed_rad_s = 0.8f;
+        float       reacquire_turn_speed_rad_s = 0.25f;
         float       lost_delay_sec = 0.2f;
         float       memory_timeout_sec = 5.0f;
         float       search_timeout_sec = 8.0f;
+    };
+
+    struct VisualServoConfig {
+        bool  enable = true;
+        float engage_distance_m = 1.1f;
+        float lost_target_distance_m = 1.8f;
+        float align_deadband_px = 36.0f;
+        float forward_deadband_px = 20.0f;
+        float align_band_ratio = 0.2f;
+        float turn_gain = 0.9f;
+        float min_turn_speed_rad_s = 0.15f;
+        float max_turn_speed_rad_s = 0.45f;
+        float linear_gain = 0.45f;
+        float min_linear_speed_m_s = 0.08f;
+        float max_linear_speed_m_s = 0.3f;
     };
 
     bool  enable = true;
@@ -197,7 +218,9 @@ struct TrackingConfig {
     float min_iou_for_match = 0.05f;
     float max_center_distance_px = 120.0f;
     float max_depth_delta_mm = 800.0f;
+    MapMatchConfig map_match;
     RecoveryConfig recovery;
+    VisualServoConfig visual_servo;
 };
 
 struct GoalConfig {
@@ -452,6 +475,8 @@ struct TrackedTargetState {
     int                  lost_frames = 0;
     bool                 goal_dispatched = false;
     DetectionDepthResult last_result;
+    geometry_msgs::msg::PointStamped last_map_point;
+    bool                 last_map_point_valid = false;
     rclcpp::Time         last_stamp;
 };
 
@@ -462,12 +487,27 @@ struct RememberedTargetState {
     bool                           map_point_valid = false;
     float                          image_offset_px = 0.0f;
     float                          camera_lateral_m = 0.0f;
+    float                          depth_m = std::numeric_limits<float>::infinity();
 };
 
 struct RecoveryRotationState {
     bool         active = false;
     int          direction = 1;
     rclcpp::Time start_stamp;
+};
+
+struct VisualServoState {
+    bool         active = false;
+    bool         command_active = false;
+    rclcpp::Time activation_stamp;
+};
+
+struct TrackMemoryState {
+    int32_t                        track_id = -1;
+    geometry_msgs::msg::PointStamped map_point;
+    float                          robot_distance_m = std::numeric_limits<float>::infinity();
+    float                          robot_bearing_rad = 0.0f;
+    rclcpp::Time                   stamp;
 };
 
 struct LCVision::Impl {
@@ -519,13 +559,28 @@ struct LCVision::Impl {
         const;
     void clearTrackedTarget();
     static cv::Point2f detectionCenter(const DetectionDepthResult &result);
+    bool buildDetectionMapPoint(
+        const DetectionDepthResult &result, const rclcpp::Time &stamp, geometry_msgs::msg::PointStamped &map_point) const;
+    bool computeRobotRelativeObservation(
+        const geometry_msgs::msg::PointStamped &map_point, float &distance_m, float &bearing_rad) const;
+    static double angleDifferenceRad(double lhs, double rhs);
+    int32_t allocateTrackId();
+    void upsertTrackMemory(
+        int32_t track_id, const geometry_msgs::msg::PointStamped &map_point, float robot_distance_m,
+        float robot_bearing_rad, const rclcpp::Time &stamp);
+    void assignTrackIds(std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
     void handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg);
     void rememberTargetObservation(
         const DetectionDepthResult &result, int width, const rclcpp::Time &stamp,
         const std::optional<geometry_msgs::msg::PointStamped> &map_point = std::nullopt);
-    void publishRecoveryCommand(double angular_velocity);
+    void publishTrackingCommand(double linear_velocity, double angular_velocity);
+    void stopTrackingMotion(const std::string &reason, bool clear_visual_servo_mode = false);
     void stopRecoveryRotation(const std::string &reason);
-    void maybeRecoverLostTarget(const rclcpp::Time &stamp);
+    bool shouldKeepVisualServo(const rclcpp::Time &stamp) const;
+    bool isTargetAlignedForForwardMotion(const DetectionDepthResult &selected, int width) const;
+    bool maybeRunVisualServo(const DetectionDepthResult &selected, int width, const rclcpp::Time &stamp);
+    void maybeRecoverLostTarget(
+        const std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
     int selectTrackedDetection(
         std::vector<DetectionDepthResult> &results, int width, int height, const rclcpp::Time &stamp);
     void storeCostmap(const nav2_msgs::msg::Costmap::SharedPtr msg);
@@ -655,6 +710,8 @@ struct LCVision::Impl {
     TrackedTargetState tracked_target;
     RememberedTargetState remembered_target;
     RecoveryRotationState recovery_rotation;
+    VisualServoState visual_servo;
+    std::vector<TrackMemoryState> track_memories;
     std::atomic<bool> navigation_goal_active{false};
     std::atomic<bool> external_navigation_active{false};
     std::atomic<bool> tracking_runtime_enabled{true};

@@ -10,6 +10,8 @@ void LCVision::Impl::clearTrackedTarget() {
     tracked_target.lost_frames = 0;
     tracked_target.goal_dispatched = false;
     tracked_target.last_result = DetectionDepthResult();
+    tracked_target.last_map_point = geometry_msgs::msg::PointStamped();
+    tracked_target.last_map_point_valid = false;
     tracked_target.last_stamp = rclcpp::Time{};
     tracked_target.next_track_id = next_track_id;
 }
@@ -18,6 +20,144 @@ cv::Point2f LCVision::Impl::detectionCenter(const DetectionDepthResult &result) 
     return cv::Point2f(
         static_cast<float>(result.detection.box.x) + static_cast<float>(result.detection.box.width) * 0.5f,
         static_cast<float>(result.detection.box.y) + static_cast<float>(result.detection.box.height) * 0.5f);
+}
+
+bool LCVision::Impl::buildDetectionMapPoint(
+    const DetectionDepthResult &result, const rclcpp::Time &stamp, geometry_msgs::msg::PointStamped &map_point) const {
+    if (!result.camera_point_valid) {
+        return false;
+    }
+
+    geometry_msgs::msg::PointStamped camera_point;
+    camera_point.header.stamp = toBuiltinTime(stamp);
+    camera_point.header.frame_id = depth.frame_id;
+    camera_point.point = result.camera_point;
+    return transformPointToFrame(camera_point, goal.global_frame_id, map_point);
+}
+
+bool LCVision::Impl::computeRobotRelativeObservation(
+    const geometry_msgs::msg::PointStamped &map_point, float &distance_m, float &bearing_rad) const {
+    geometry_msgs::msg::PointStamped robot_point;
+    if (!transformPointToFrame(map_point, goal.robot_frame_id, robot_point)) {
+        return false;
+    }
+
+    distance_m = static_cast<float>(std::hypot(robot_point.point.x, robot_point.point.y));
+    bearing_rad = static_cast<float>(std::atan2(robot_point.point.y, robot_point.point.x));
+    return true;
+}
+
+double LCVision::Impl::angleDifferenceRad(const double lhs, const double rhs) {
+    double delta = std::fmod(lhs - rhs, 2.0 * M_PI);
+    if (delta > M_PI) {
+        delta -= 2.0 * M_PI;
+    } else if (delta < -M_PI) {
+        delta += 2.0 * M_PI;
+    }
+    return delta;
+}
+
+int32_t LCVision::Impl::allocateTrackId() {
+    return tracked_target.next_track_id++;
+}
+
+void LCVision::Impl::upsertTrackMemory(
+    const int32_t track_id, const geometry_msgs::msg::PointStamped &map_point, const float robot_distance_m,
+    const float robot_bearing_rad, const rclcpp::Time &stamp) {
+    for (auto &memory : track_memories) {
+        if (memory.track_id != track_id) {
+            continue;
+        }
+
+        memory.map_point = map_point;
+        memory.robot_distance_m = robot_distance_m;
+        memory.robot_bearing_rad = robot_bearing_rad;
+        memory.stamp = stamp;
+        return;
+    }
+
+    TrackMemoryState memory;
+    memory.track_id = track_id;
+    memory.map_point = map_point;
+    memory.robot_distance_m = robot_distance_m;
+    memory.robot_bearing_rad = robot_bearing_rad;
+    memory.stamp = stamp;
+    track_memories.push_back(std::move(memory));
+}
+
+void LCVision::Impl::assignTrackIds(std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp) {
+    struct CandidateObservation {
+        int index = -1;
+        geometry_msgs::msg::PointStamped map_point;
+        float robot_distance_m = std::numeric_limits<float>::infinity();
+        float robot_bearing_rad = 0.0f;
+        bool valid = false;
+    };
+
+    std::vector<CandidateObservation> observations;
+    observations.reserve(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        results[i].track_id = -1;
+        results[i].selected = false;
+
+        CandidateObservation observation;
+        observation.index = static_cast<int>(i);
+        observation.valid =
+            buildDetectionMapPoint(results[i], stamp, observation.map_point) &&
+            computeRobotRelativeObservation(
+                observation.map_point, observation.robot_distance_m, observation.robot_bearing_rad);
+        observations.push_back(std::move(observation));
+    }
+
+    std::vector<size_t> history_order(track_memories.size());
+    std::iota(history_order.begin(), history_order.end(), 0);
+    std::sort(history_order.begin(), history_order.end(), [this](const size_t lhs, const size_t rhs) {
+        return track_memories[lhs].stamp > track_memories[rhs].stamp;
+    });
+
+    std::vector<bool> used_history(track_memories.size(), false);
+    for (auto &observation : observations) {
+        if (!observation.valid) {
+            continue;
+        }
+
+        for (const size_t history_index : history_order) {
+            if (used_history[history_index]) {
+                continue;
+            }
+
+            const auto &memory = track_memories[history_index];
+            const double distance_delta =
+                std::abs(static_cast<double>(observation.robot_distance_m) - static_cast<double>(memory.robot_distance_m));
+            if (distance_delta > static_cast<double>(tracking.map_match.distance_tolerance_m)) {
+                continue;
+            }
+
+            const double angle_delta = std::abs(angleDifferenceRad(
+                static_cast<double>(observation.robot_bearing_rad), static_cast<double>(memory.robot_bearing_rad)));
+            if (angle_delta > static_cast<double>(tracking.map_match.angle_tolerance_rad)) {
+                continue;
+            }
+
+            results[static_cast<size_t>(observation.index)].track_id = memory.track_id;
+            used_history[history_index] = true;
+            break;
+        }
+    }
+
+    for (const auto &observation : observations) {
+        if (!observation.valid) {
+            continue;
+        }
+
+        auto &result = results[static_cast<size_t>(observation.index)];
+        if (result.track_id < 0) {
+            result.track_id = allocateTrackId();
+        }
+
+        upsertTrackMemory(
+            result.track_id, observation.map_point, observation.robot_distance_m, observation.robot_bearing_rad, stamp);
+    }
 }
 
 void LCVision::Impl::handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
@@ -58,20 +198,38 @@ void LCVision::Impl::rememberTargetObservation(
     remembered_target.image_offset_px = detectionCenter(result).x - static_cast<float>(width) * 0.5f;
     remembered_target.camera_lateral_m =
         result.camera_point_valid ? static_cast<float>(result.camera_point.x) : 0.0f;
+    remembered_target.depth_m = result.depth_valid ? result.depth_mm / 1000.0f : std::numeric_limits<float>::infinity();
     remembered_target.map_point_valid = map_point.has_value();
     if (map_point.has_value()) {
         remembered_target.map_point = *map_point;
     }
 }
 
-void LCVision::Impl::publishRecoveryCommand(const double angular_velocity) {
+void LCVision::Impl::publishTrackingCommand(const double linear_velocity, const double angular_velocity) {
     if (recovery_cmd_vel_pub == nullptr) {
         return;
     }
 
     geometry_msgs::msg::Twist cmd;
+    cmd.linear.x = linear_velocity;
     cmd.angular.z = angular_velocity;
     recovery_cmd_vel_pub->publish(cmd);
+}
+
+void LCVision::Impl::stopTrackingMotion(const std::string &reason, const bool clear_visual_servo_mode) {
+    const bool had_motion = recovery_rotation.active || visual_servo.command_active;
+    recovery_rotation.active = false;
+    visual_servo.command_active = false;
+    if (clear_visual_servo_mode) {
+        visual_servo.active = false;
+    }
+
+    if (!had_motion) {
+        return;
+    }
+
+    publishTrackingCommand(0.0, 0.0);
+    RCLCPP_INFO(node.get_logger(), "Stopped visual tracking motion: %s", reason.c_str());
 }
 
 void LCVision::Impl::stopRecoveryRotation(const std::string &reason) {
@@ -80,23 +238,134 @@ void LCVision::Impl::stopRecoveryRotation(const std::string &reason) {
     }
 
     recovery_rotation.active = false;
-    publishRecoveryCommand(0.0);
+    publishTrackingCommand(0.0, 0.0);
     RCLCPP_INFO(node.get_logger(), "Stopped visual recovery rotation: %s", reason.c_str());
 }
 
-void LCVision::Impl::maybeRecoverLostTarget(const rclcpp::Time &stamp) {
+bool LCVision::Impl::shouldKeepVisualServo(const rclcpp::Time &stamp) const {
+    if (!tracking.visual_servo.enable || !visual_servo.active || !remembered_target.available) {
+        return false;
+    }
+
+    const double memory_age = (stamp - remembered_target.stamp).seconds();
+    if (memory_age > static_cast<double>(tracking.recovery.memory_timeout_sec)) {
+        return false;
+    }
+
+    return remembered_target.depth_m <= tracking.visual_servo.lost_target_distance_m;
+}
+
+bool LCVision::Impl::isTargetAlignedForForwardMotion(const DetectionDepthResult &selected, const int width) const {
+    const float image_center_x = static_cast<float>(width) * 0.5f;
+    const float box_center_x = detectionCenter(selected).x;
+    const float half_band =
+        std::max(1.0f, static_cast<float>(selected.detection.box.width) * tracking.visual_servo.align_band_ratio);
+    const float band_left = box_center_x - half_band;
+    const float band_right = box_center_x + half_band;
+    return image_center_x >= band_left && image_center_x <= band_right;
+}
+
+bool LCVision::Impl::maybeRunVisualServo(
+    const DetectionDepthResult &selected, const int width, const rclcpp::Time &stamp) {
+    if (!tracking.visual_servo.enable || !selected.depth_valid) {
+        if (visual_servo.active) {
+            visual_servo.active = false;
+        }
+        return false;
+    }
+
+    const float target_distance_m = selected.depth_mm / 1000.0f;
+    if (!visual_servo.active && target_distance_m <= tracking.visual_servo.engage_distance_m) {
+        visual_servo.active = true;
+        visual_servo.activation_stamp = stamp;
+        RCLCPP_INFO(
+            node.get_logger(), "Entering pure visual tracking mode at %.2fm", static_cast<double>(target_distance_m));
+    }
+
+    if (!visual_servo.active) {
+        return false;
+    }
+
+    if (target_distance_m > tracking.visual_servo.lost_target_distance_m) {
+        stopTrackingMotion("visual target moved beyond visual-servo range", true);
+        return false;
+    }
+
+    if (navigation_goal_active.load(std::memory_order_relaxed)) {
+        node.cancelCurrentNavigationGoal("switching to pure visual tracking");
+    }
+
+    tracked_target.goal_dispatched = false;
+
+    const float image_center_x = static_cast<float>(width) * 0.5f;
+    const float offset_px = detectionCenter(selected).x - image_center_x;
+    const float normalized_error = offset_px / std::max(1.0f, image_center_x);
+    const float abs_offset_px = std::abs(offset_px);
+    const bool aligned_for_forward = isTargetAlignedForForwardMotion(selected, width);
+
+    double angular_velocity = 0.0;
+    if (!aligned_for_forward && abs_offset_px > tracking.visual_servo.forward_deadband_px) {
+        angular_velocity = std::clamp(
+            static_cast<double>(normalized_error) * static_cast<double>(tracking.visual_servo.turn_gain),
+            -static_cast<double>(tracking.visual_servo.max_turn_speed_rad_s),
+            static_cast<double>(tracking.visual_servo.max_turn_speed_rad_s));
+        if (std::abs(angular_velocity) > 1.0e-4) {
+            const double min_turn_speed = static_cast<double>(tracking.visual_servo.min_turn_speed_rad_s);
+            angular_velocity = std::copysign(std::max(std::abs(angular_velocity), min_turn_speed), angular_velocity);
+        }
+    }
+
+    if (recovery_rotation.active && !aligned_for_forward) {
+        const double recovery_direction = static_cast<double>(recovery_rotation.direction);
+        if (std::abs(angular_velocity) <= 1.0e-4 || angular_velocity * recovery_direction < 0.0) {
+            angular_velocity =
+                recovery_direction * static_cast<double>(tracking.visual_servo.min_turn_speed_rad_s);
+        }
+    }
+
+    double linear_velocity = 0.0;
+    const double distance_error_m =
+        static_cast<double>(target_distance_m) - static_cast<double>(goal.standoff_distance_m);
+    if (distance_error_m > 0.0 && aligned_for_forward) {
+        linear_velocity = std::clamp(
+            distance_error_m * static_cast<double>(tracking.visual_servo.linear_gain),
+            static_cast<double>(tracking.visual_servo.min_linear_speed_m_s),
+            static_cast<double>(tracking.visual_servo.max_linear_speed_m_s));
+    }
+
+    if (aligned_for_forward && distance_error_m <= 0.05) {
+        linear_velocity = 0.0;
+        angular_velocity = 0.0;
+    }
+
+    if (aligned_for_forward && recovery_rotation.active) {
+        stopRecoveryRotation("target alignment band reached image center");
+    }
+
+    publishTrackingCommand(linear_velocity, angular_velocity);
+    visual_servo.command_active = true;
+    return true;
+}
+
+void LCVision::Impl::maybeRecoverLostTarget(
+    const std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp) {
     if (!tracking.recovery.enable) {
         return;
     }
 
     if (external_navigation_active.load(std::memory_order_relaxed)) {
         if (recovery_rotation.active) {
-            stopRecoveryRotation("external navigation is active");
+            stopTrackingMotion("external navigation is active", false);
         }
         return;
     }
 
-    if (navigation_goal_active.load(std::memory_order_relaxed)) {
+    if (visual_servo.active && !shouldKeepVisualServo(stamp)) {
+        stopTrackingMotion("visual servo memory expired or target moved too far", true);
+    }
+
+    const bool keep_visual_servo = shouldKeepVisualServo(stamp);
+    if (!keep_visual_servo && navigation_goal_active.load(std::memory_order_relaxed)) {
         if (recovery_rotation.active) {
             stopRecoveryRotation("navigation is active");
         }
@@ -142,16 +411,32 @@ void LCVision::Impl::maybeRecoverLostTarget(const rclcpp::Time &stamp) {
             node.get_logger(), "Started visual recovery rotation: direction=%d memory_age=%.2fs", direction, memory_age);
     }
 
+    bool has_visible_candidate = false;
+    for (const auto &result : results) {
+        if (result.depth_valid && result.camera_point_valid) {
+            has_visible_candidate = true;
+            break;
+        }
+    }
+
     const double recovery_age = (stamp - recovery_rotation.start_stamp).seconds();
     if (recovery_age > static_cast<double>(tracking.recovery.search_timeout_sec)) {
-        stopRecoveryRotation("recovery timeout");
+        stopTrackingMotion("recovery timeout", true);
         clearTrackedTarget();
         remembered_target.available = false;
         return;
     }
 
-    publishRecoveryCommand(
-        static_cast<double>(recovery_rotation.direction) * static_cast<double>(tracking.recovery.turn_speed_rad_s));
+    double turn_speed = static_cast<double>(tracking.recovery.turn_speed_rad_s);
+    if (has_visible_candidate) {
+        turn_speed = std::min(
+            turn_speed, static_cast<double>(tracking.recovery.reacquire_turn_speed_rad_s));
+    }
+    if (keep_visual_servo) {
+        turn_speed = std::min(turn_speed, static_cast<double>(tracking.visual_servo.max_turn_speed_rad_s));
+    }
+
+    publishTrackingCommand(0.0, static_cast<double>(recovery_rotation.direction) * turn_speed);
 }
 
 int LCVision::Impl::selectTrackedDetection(
@@ -181,42 +466,18 @@ int LCVision::Impl::selectTrackedDetection(
         return -1;
     }
 
+    assignTrackIds(results, stamp);
+
     if (tracked_target.active) {
-        const cv::Point2f previous_center = detectionCenter(tracked_target.last_result);
-        const float       previous_depth = tracked_target.last_result.depth_mm;
-        double            best_cost = std::numeric_limits<double>::infinity();
-        int               best_index = -1;
-
+        int best_index = -1;
         for (const int candidate_index : candidates) {
-            auto &candidate = results[static_cast<size_t>(candidate_index)];
-            const cv::Point2f center = detectionCenter(candidate);
-            const double      center_distance = cv::norm(center - previous_center);
-            if (center_distance > static_cast<double>(tracking.max_center_distance_px)) {
-                continue;
-            }
-
-            const double iou = rectIou(tracked_target.last_result.detection.box, candidate.detection.box);
-            const double depth_delta = std::abs(static_cast<double>(candidate.depth_mm - previous_depth));
-            if (depth_delta > static_cast<double>(tracking.max_depth_delta_mm)) {
-                continue;
-            }
-
-            if (iou < static_cast<double>(tracking.min_iou_for_match) &&
-                center_distance > static_cast<double>(tracking.max_center_distance_px) * 0.5) {
-                continue;
-            }
-
-            const double cost =
-                center_distance / std::max(1.0f, tracking.max_center_distance_px) +
-                depth_delta / std::max(1.0f, tracking.max_depth_delta_mm) + (1.0 - iou);
-            if (cost < best_cost) {
-                best_cost = cost;
+            if (results[static_cast<size_t>(candidate_index)].track_id == tracked_target.current_track_id) {
                 best_index = candidate_index;
+                break;
             }
         }
 
         if (best_index >= 0) {
-            stopRecoveryRotation("target reacquired");
             tracked_target.lost_frames = 0;
             ++tracked_target.stable_frames;
             tracked_target.last_result = results[static_cast<size_t>(best_index)];
@@ -255,11 +516,10 @@ int LCVision::Impl::selectTrackedDetection(
     }
 
     tracked_target.active = true;
-    tracked_target.current_track_id = tracked_target.next_track_id++;
+    tracked_target.current_track_id = results[static_cast<size_t>(best_index)].track_id;
     tracked_target.stable_frames = 1;
     tracked_target.lost_frames = 0;
     tracked_target.goal_dispatched = false;
-    stopRecoveryRotation("target acquired");
     tracked_target.last_result = results[static_cast<size_t>(best_index)];
     tracked_target.last_stamp = stamp;
     results[static_cast<size_t>(best_index)].selected = true;
@@ -592,13 +852,13 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
     std::vector<DetectionDepthResult> &results, const int width, const int height, const rclcpp::Time &stamp) {
     if (!goal_runtime_enabled.load(std::memory_order_relaxed) ||
         !tracking_runtime_enabled.load(std::memory_order_relaxed)) {
-        stopRecoveryRotation("tracking or goal runtime disabled");
+        stopTrackingMotion("tracking or goal runtime disabled", true);
         return;
     }
 
     const int selected_index = selectTrackedDetection(results, width, height, stamp);
     if (selected_index < 0) {
-        maybeRecoverLostTarget(stamp);
+        maybeRecoverLostTarget(results, stamp);
         return;
     }
 
@@ -615,9 +875,19 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
     }
 
     rememberTargetObservation(selected, width, stamp, map_point);
+    tracked_target.last_map_point = map_point;
+    tracked_target.last_map_point_valid = true;
 
     const auto goal_pose = buildSafeGoalPose(map_point, stamp);
     publishTrackedTargetDebug(camera_point, map_point, goal_pose);
+
+    if (maybeRunVisualServo(selected, width, stamp)) {
+        return;
+    }
+
+    if (visual_servo.command_active) {
+        stopTrackingMotion("falling back to navigation-guided tracking", false);
+    }
 
     if (!goal_pose.has_value() || tracked_target.goal_dispatched || tracked_target.stable_frames < goal.min_stable_frames ||
         navigation_goal_active.load() ||
