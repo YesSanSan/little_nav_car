@@ -5,7 +5,7 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
 from ament_index_python.packages import get_package_share_directory
@@ -92,12 +92,6 @@ def make_request_handler():
                 if route == "/api/control/stop_slam":
                     self._send_json(HTTPStatus.OK, self.app.stop_slam())
                     return
-                if route == "/api/control/start_nav":
-                    self._send_json(HTTPStatus.OK, self.app.start_navigation())
-                    return
-                if route == "/api/control/stop_nav":
-                    self._send_json(HTTPStatus.OK, self.app.stop_navigation())
-                    return
                 if route == "/api/control/start_tracking":
                     self._send_json(HTTPStatus.OK, self.app.set_tracking_enabled(True))
                     return
@@ -121,8 +115,8 @@ def make_request_handler():
                 if route == "/api/return_point/current":
                     self._send_json(HTTPStatus.OK, self.app.set_return_pose_to_current())
                     return
-                if route == "/api/return_point/clear":
-                    self._send_json(HTTPStatus.OK, self.app.clear_return_pose())
+                if route == "/api/return_point/startup":
+                    self._send_json(HTTPStatus.OK, self.app.set_return_pose_to_startup())
                     return
 
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "message": f"Unknown route: {route}"})
@@ -210,11 +204,14 @@ class WebControlNode(Node):
         self._latest_map: Optional[OccupancyGrid] = None
         self._latest_target_point: Optional[PointStamped] = None
         self._latest_goal_pose: Optional[PoseStamped] = None
+        self._startup_pose: Optional[Dict[str, Any]] = None
         self._return_pose: Optional[Dict[str, Any]] = None
         self._vision_status: Dict[str, Any] = {
             "available": False,
-            "tracking_enabled": False,
-            "goal_enabled": False,
+            "desired_tracking_enabled": False,
+            "effective_tracking_enabled": False,
+            "last_applied_tracking_enabled": False,
+            "pending_apply": False,
             "last_error": "lc_vision parameter service unavailable",
         }
 
@@ -281,8 +278,10 @@ class WebControlNode(Node):
             with self.state_lock:
                 self._vision_status = {
                     "available": False,
-                    "tracking_enabled": False,
-                    "goal_enabled": False,
+                    "desired_tracking_enabled": self._vision_status["desired_tracking_enabled"],
+                    "effective_tracking_enabled": False,
+                    "last_applied_tracking_enabled": self._vision_status["last_applied_tracking_enabled"],
+                    "pending_apply": self._vision_status["pending_apply"],
                     "last_error": "lc_vision parameter service unavailable",
                 }
             return
@@ -297,24 +296,135 @@ class WebControlNode(Node):
             values = getattr(response, "values", [])
             tracking_enabled = bool(parameter_value_to_python(values[0])) if len(values) > 0 else False
             goal_enabled = bool(parameter_value_to_python(values[1])) if len(values) > 1 else False
-            status = {
-                "available": True,
-                "tracking_enabled": tracking_enabled,
-                "goal_enabled": goal_enabled,
-                "last_error": None,
-            }
+            effective_enabled = tracking_enabled and goal_enabled
+            status = self._update_vision_status_after_read(effective_enabled)
         except Exception as exc:
-            status = {
-                "available": False,
-                "tracking_enabled": False,
-                "goal_enabled": False,
-                "last_error": str(exc),
-            }
+            with self.state_lock:
+                status = {
+                    "available": False,
+                    "desired_tracking_enabled": self._vision_status["desired_tracking_enabled"],
+                    "effective_tracking_enabled": False,
+                    "last_applied_tracking_enabled": self._vision_status["last_applied_tracking_enabled"],
+                    "pending_apply": self._vision_status["pending_apply"],
+                    "last_error": str(exc),
+                }
         finally:
             self._vision_status_request_pending = False
 
         with self.state_lock:
             self._vision_status = status
+        self._save_return_pose()
+
+    def _default_state_payload(self) -> Dict[str, Any]:
+        return {
+            "startup_pose": None,
+            "return_pose": None,
+            "vision": {
+                "desired_tracking_enabled": False,
+                "last_applied_tracking_enabled": False,
+                "apply_pending": False,
+            },
+        }
+
+    def _current_state_payload(self) -> Dict[str, Any]:
+        with self.state_lock:
+            return {
+                "startup_pose": dict(self._startup_pose) if self._startup_pose is not None else None,
+                "return_pose": dict(self._return_pose) if self._return_pose is not None else None,
+                "vision": {
+                    "desired_tracking_enabled": bool(self._vision_status["desired_tracking_enabled"]),
+                    "last_applied_tracking_enabled": bool(
+                        self._vision_status["last_applied_tracking_enabled"]
+                    ),
+                    "apply_pending": bool(self._vision_status["pending_apply"]),
+                },
+            }
+
+    def _parse_saved_state(
+        self, payload: Dict[str, Any]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Dict[str, Any]]:
+        state_payload = self._default_state_payload()
+
+        if {"frame_id", "x", "y", "yaw"}.issubset(payload):
+            state_payload["startup_pose"] = {
+                "frame_id": str(payload["frame_id"]),
+                "x": float(payload["x"]),
+                "y": float(payload["y"]),
+                "yaw": float(payload["yaw"]),
+            }
+            state_payload["return_pose"] = dict(state_payload["startup_pose"])
+            return state_payload["startup_pose"], state_payload["return_pose"], state_payload["vision"]
+
+        startup_pose = payload.get("startup_pose")
+        if isinstance(startup_pose, dict) and {"frame_id", "x", "y", "yaw"}.issubset(startup_pose):
+            state_payload["startup_pose"] = {
+                "frame_id": str(startup_pose["frame_id"]),
+                "x": float(startup_pose["x"]),
+                "y": float(startup_pose["y"]),
+                "yaw": float(startup_pose["yaw"]),
+            }
+
+        return_pose = payload.get("return_pose")
+        if isinstance(return_pose, dict) and {"frame_id", "x", "y", "yaw"}.issubset(return_pose):
+            state_payload["return_pose"] = {
+                "frame_id": str(return_pose["frame_id"]),
+                "x": float(return_pose["x"]),
+                "y": float(return_pose["y"]),
+                "yaw": float(return_pose["yaw"]),
+            }
+
+        vision = payload.get("vision")
+        if isinstance(vision, dict):
+            state_payload["vision"] = {
+                "desired_tracking_enabled": bool(vision.get("desired_tracking_enabled", False)),
+                "last_applied_tracking_enabled": bool(vision.get("last_applied_tracking_enabled", False)),
+                "apply_pending": bool(vision.get("apply_pending", False)),
+            }
+
+        if state_payload["return_pose"] is None and state_payload["startup_pose"] is not None:
+            state_payload["return_pose"] = dict(state_payload["startup_pose"])
+
+        return state_payload["startup_pose"], state_payload["return_pose"], state_payload["vision"]
+
+    def _update_vision_status_after_read(self, effective_enabled: bool) -> Dict[str, Any]:
+        with self.state_lock:
+            desired_enabled = bool(self._vision_status["desired_tracking_enabled"])
+            last_applied_enabled = bool(self._vision_status["last_applied_tracking_enabled"])
+
+        if effective_enabled != desired_enabled:
+            try:
+                self._apply_tracking_state(desired_enabled)
+                message = (
+                    "视觉追踪期望状态已自动同步到 lc_vision"
+                    if desired_enabled
+                    else "视觉追踪关闭状态已自动同步到 lc_vision"
+                )
+                return {
+                    "available": True,
+                    "desired_tracking_enabled": desired_enabled,
+                    "effective_tracking_enabled": desired_enabled,
+                    "last_applied_tracking_enabled": desired_enabled,
+                    "pending_apply": False,
+                    "last_error": message,
+                }
+            except RuntimeError as exc:
+                return {
+                    "available": True,
+                    "desired_tracking_enabled": desired_enabled,
+                    "effective_tracking_enabled": effective_enabled,
+                    "last_applied_tracking_enabled": last_applied_enabled,
+                    "pending_apply": True,
+                    "last_error": str(exc),
+                }
+
+        return {
+            "available": True,
+            "desired_tracking_enabled": desired_enabled,
+            "effective_tracking_enabled": effective_enabled,
+            "last_applied_tracking_enabled": effective_enabled,
+            "pending_apply": False,
+            "last_error": None,
+        }
 
     def _load_return_pose(self) -> None:
         if not self.state_file.is_file():
@@ -322,31 +432,82 @@ class WebControlNode(Node):
 
         try:
             payload = json.loads(self.state_file.read_text(encoding="utf-8"))
-            if {"frame_id", "x", "y", "yaw"}.issubset(payload):
-                with self.state_lock:
-                    self._return_pose = {
-                        "frame_id": str(payload["frame_id"]),
-                        "x": float(payload["x"]),
-                        "y": float(payload["y"]),
-                        "yaw": float(payload["yaw"]),
+            startup_pose, return_pose, vision_state = self._parse_saved_state(payload)
+            with self.state_lock:
+                self._startup_pose = startup_pose
+                self._return_pose = return_pose
+                self._vision_status.update(
+                    {
+                        "desired_tracking_enabled": vision_state["desired_tracking_enabled"],
+                        "last_applied_tracking_enabled": vision_state["last_applied_tracking_enabled"],
+                        "pending_apply": vision_state["apply_pending"],
                     }
+                )
         except Exception as exc:
-            self.get_logger().warn(f"Failed to load saved return pose from {self.state_file}: {exc}")
+            self.get_logger().warn(f"Failed to load saved state from {self.state_file}: {exc}")
 
     def _save_return_pose(self) -> None:
-        with self.state_lock:
-            payload = dict(self._return_pose) if self._return_pose is not None else None
+        payload = self._current_state_payload()
 
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        if payload is None:
-            if self.state_file.exists():
-                self.state_file.unlink()
-            return
-
         self.state_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+
+    def _apply_tracking_state(self, enabled: bool) -> None:
+        parameters = [
+            Parameter("tracking.enable", Parameter.Type.BOOL, enabled),
+            Parameter("goal.enable", Parameter.Type.BOOL, enabled),
+        ]
+        future = self.vision_parameter_client.set_parameters(parameters)
+        response = self._wait_for_future(
+            future,
+            5.0,
+            "Timed out while waiting for lc_vision parameter update",
+        )
+        results = getattr(response, "results", response)
+        failures = [item.reason for item in results if not item.successful]
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    def _set_desired_tracking_enabled(self, enabled: bool) -> Dict[str, Any]:
+        if not self.vision_parameter_client.wait_for_services(timeout_sec=1.0):
+            with self.state_lock:
+                self._vision_status = {
+                    "available": False,
+                    "desired_tracking_enabled": enabled,
+                    "effective_tracking_enabled": False,
+                    "last_applied_tracking_enabled": self._vision_status["last_applied_tracking_enabled"],
+                    "pending_apply": True,
+                    "last_error": "lc_vision 尚未启动，已记录期望状态，待参数服务可用后自动应用",
+                }
+            self._save_return_pose()
+            return {
+                "available": True,
+                "ok": True,
+                "tracking_enabled": enabled,
+                "pending_apply": True,
+                "message": "lc_vision 尚未启动，已记录视觉追踪开关，稍后会自动应用",
+            }
+
+        self._apply_tracking_state(enabled)
+        with self.state_lock:
+            self._vision_status = {
+                "available": True,
+                "desired_tracking_enabled": enabled,
+                "effective_tracking_enabled": enabled,
+                "last_applied_tracking_enabled": enabled,
+                "pending_apply": False,
+                "last_error": None,
+            }
+        self._save_return_pose()
+        return {
+            "ok": True,
+            "tracking_enabled": enabled,
+            "pending_apply": False,
+            "message": "视觉追踪已开启" if enabled else "视觉追踪已停止",
+        }
 
     def _run_workspace_script(self, script_name: str, *args: str) -> Dict[str, Any]:
         script_path = self.workspace_dir / script_name
@@ -449,53 +610,40 @@ class WebControlNode(Node):
 
         return result_holder.get("result")
 
-    def _set_tracking_enabled_internal(self, enabled: bool, strict: bool = True) -> Dict[str, Any]:
-        if not self.vision_parameter_client.wait_for_services(timeout_sec=1.0):
-            with self.state_lock:
-                self._vision_status = {
-                    "available": False,
-                    "tracking_enabled": False,
-                    "goal_enabled": False,
-                    "last_error": "lc_vision parameter service unavailable",
-                }
-            if strict:
-                raise RuntimeError("lc_vision is not running, cannot change tracking state")
-            return {"ok": True, "message": "lc_vision is not running, skip tracking toggle"}
+    def _ensure_return_pose_initialized(self, frame_id: str) -> Optional[Dict[str, Any]]:
+        with self.state_lock:
+            if self._startup_pose is not None and self._return_pose is not None:
+                return dict(self._return_pose)
 
-        parameters = [
-            Parameter("tracking.enable", Parameter.Type.BOOL, enabled),
-            Parameter("goal.enable", Parameter.Type.BOOL, enabled),
-        ]
-        future = self.vision_parameter_client.set_parameters(parameters)
-        response = self._wait_for_future(
-            future,
-            5.0,
-            "Timed out while waiting for lc_vision parameter update",
-        )
-        results = getattr(response, "results", response)
-        failures = [item.reason for item in results if not item.successful]
-        if failures:
-            raise RuntimeError("; ".join(failures))
+        current_pose = self._lookup_robot_pose(frame_id)
+        if current_pose is None:
+            return None
 
         with self.state_lock:
-            self._vision_status = {
-                "available": True,
-                "tracking_enabled": enabled,
-                "goal_enabled": enabled,
-                "last_error": None,
-            }
+            if self._startup_pose is None:
+                self._startup_pose = {
+                    "frame_id": current_pose["frame_id"],
+                    "x": float(current_pose["x"]),
+                    "y": float(current_pose["y"]),
+                    "yaw": float(current_pose["yaw"]),
+                }
+            if self._return_pose is None:
+                self._return_pose = {
+                    "frame_id": self._startup_pose["frame_id"],
+                    "x": float(self._startup_pose["x"]),
+                    "y": float(self._startup_pose["y"]),
+                    "yaw": float(self._startup_pose["yaw"]),
+                }
+                initialized_pose = dict(self._return_pose)
+            else:
+                initialized_pose = dict(self._return_pose)
 
-        return {
-            "ok": True,
-            "message": "视觉追踪已开启" if enabled else "视觉追踪已停止",
-            "tracking_enabled": enabled,
-            "goal_enabled": enabled,
-        }
+        self._save_return_pose()
+        return initialized_pose
 
     def build_status_payload(self) -> Dict[str, Any]:
         with self.state_lock:
             latest_map = self._latest_map
-            return_pose = dict(self._return_pose) if self._return_pose is not None else None
             target_point = self._point_to_dict(self._latest_target_point) if self._latest_target_point else None
             goal_pose = self._pose_to_dict(self._latest_goal_pose) if self._latest_goal_pose else None
             vision_status = dict(self._vision_status)
@@ -503,6 +651,7 @@ class WebControlNode(Node):
         map_frame = self.global_frame
         if latest_map is not None and latest_map.header.frame_id:
             map_frame = latest_map.header.frame_id
+        return_pose = self._ensure_return_pose_initialized(map_frame)
 
         return {
             "ok": True,
@@ -511,7 +660,6 @@ class WebControlNode(Node):
             "workspace_dir": str(self.workspace_dir),
             "stacks": {
                 "slam": self._is_stack_running("slam"),
-                "nav": self._is_stack_running("nav"),
             },
             "map": {
                 "available": latest_map is not None,
@@ -529,7 +677,6 @@ class WebControlNode(Node):
     def build_map_payload(self) -> Dict[str, Any]:
         with self.state_lock:
             map_msg = self._latest_map
-            return_pose = dict(self._return_pose) if self._return_pose is not None else None
             target_point = self._point_to_dict(self._latest_target_point) if self._latest_target_point else None
             goal_pose = self._pose_to_dict(self._latest_goal_pose) if self._latest_goal_pose else None
 
@@ -541,6 +688,7 @@ class WebControlNode(Node):
             }
 
         map_frame = map_msg.header.frame_id or self.global_frame
+        return_pose = self._ensure_return_pose_initialized(map_frame)
         origin = map_msg.info.origin
         return {
             "ok": True,
@@ -562,8 +710,6 @@ class WebControlNode(Node):
         }
 
     def start_slam(self) -> Dict[str, Any]:
-        if self._is_stack_running("nav"):
-            raise RuntimeError("Navigation stack is running, stop it before starting SLAM")
         result = self._run_workspace_script("slam.sh", "--detach")
         result["mode"] = "slam"
         return result
@@ -573,20 +719,8 @@ class WebControlNode(Node):
         result["mode"] = "slam"
         return result
 
-    def start_navigation(self) -> Dict[str, Any]:
-        if self._is_stack_running("slam"):
-            raise RuntimeError("SLAM stack is running, stop it before starting navigation")
-        result = self._run_workspace_script("nav.sh", "--detach")
-        result["mode"] = "nav"
-        return result
-
-    def stop_navigation(self) -> Dict[str, Any]:
-        result = self._run_workspace_script("nav.sh", "--stop")
-        result["mode"] = "nav"
-        return result
-
     def set_tracking_enabled(self, enabled: bool) -> Dict[str, Any]:
-        return self._set_tracking_enabled_internal(enabled, strict=True)
+        return self._set_desired_tracking_enabled(enabled)
 
     def set_return_pose_from_map_click(
         self, x: float, y: float, yaw: Optional[float] = None, frame_id: Optional[str] = None
@@ -622,27 +756,31 @@ class WebControlNode(Node):
             current_pose["frame_id"],
         )
 
-    def clear_return_pose(self) -> Dict[str, Any]:
+    def set_return_pose_to_startup(self) -> Dict[str, Any]:
+        startup_pose = self._ensure_return_pose_initialized(self.global_frame)
+        if startup_pose is None:
+            raise RuntimeError("Startup pose is unavailable, please wait for robot pose")
+
         with self.state_lock:
-            self._return_pose = None
+            if self._startup_pose is None:
+                raise RuntimeError("Startup pose is unavailable")
+            self._return_pose = dict(self._startup_pose)
+            return_pose = dict(self._return_pose)
         self._save_return_pose()
+
         return {
             "ok": True,
-            "message": "返航点已清除",
-            "return_pose": None,
+            "message": "返航点已恢复为启动位置",
+            "return_pose": return_pose,
         }
 
     def return_home(self) -> Dict[str, Any]:
-        with self.state_lock:
-            return_pose = dict(self._return_pose) if self._return_pose is not None else None
-
+        return_pose = self._ensure_return_pose_initialized(self.global_frame)
         if return_pose is None:
-            raise RuntimeError("Return point is not set")
-
-        self._set_tracking_enabled_internal(False, strict=False)
+            raise RuntimeError("Return point is unavailable, please wait for robot pose")
 
         if not self.navigate_client.wait_for_server(timeout_sec=1.5):
-            raise RuntimeError("navigate_to_pose is unavailable, please start navigation first")
+            raise RuntimeError("navigate_to_pose is unavailable, please start navigation support first")
 
         goal = NavigateToPose.Goal()
         goal.pose = self._build_pose_stamped(return_pose)
@@ -657,7 +795,7 @@ class WebControlNode(Node):
 
         return {
             "ok": True,
-            "message": "返航目标已发送到 Nav2",
+            "message": "返航目标已发送",
             "return_pose": return_pose,
         }
 

@@ -3,7 +3,7 @@
 <package format="3">
   <name>lc_web_control</name>
   <version>0.0.0</version>
-  <description>Web dashboard for stack control, map preview, and return-home actions.</description>
+  <description>Web dashboard for SLAM control, map preview, and vision tracking.</description>
   <maintainer email="cmls@todo.todo">cmls</maintainer>
   <license>TODO: License declaration</license>
 

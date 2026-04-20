@@ -31,7 +31,7 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "workspace_dir",
                 default_value=default_workspace,
-                description="Workspace root used for calling slam.sh/nav.sh",
+                description="Workspace root used for calling slam.sh",
             ),
             DeclareLaunchArgument(
                 "state_file",

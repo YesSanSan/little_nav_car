@@ -70,16 +70,6 @@ body {
   line-height: 1.65;
 }
 
-.hero-badge {
-  flex-shrink: 0;
-  padding: 18px 20px;
-  border-radius: 22px;
-  background: rgba(15, 118, 110, 0.1);
-  color: var(--primary-strong);
-  font-weight: 700;
-  max-width: 280px;
-}
-
 .grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -177,6 +167,21 @@ button.warn {
   line-height: 1.6;
 }
 
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.toggle-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--primary);
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -207,19 +212,30 @@ button.warn {
 .map-shell {
   position: relative;
   overflow: hidden;
+  min-height: min(72vh, 640px);
   border-radius: 22px;
   background:
     linear-gradient(180deg, rgba(51, 39, 27, 0.03), rgba(51, 39, 27, 0.08)),
     #f6f1e8;
   border: 1px solid rgba(90, 63, 38, 0.12);
+  touch-action: none;
 }
 
 #mapCanvas {
-  display: block;
-  width: 100%;
-  max-height: 72vh;
+  position: absolute;
+  inset: 0;
   image-rendering: pixelated;
-  cursor: crosshair;
+  cursor: grab;
+}
+
+#mapCanvas:active {
+  cursor: grabbing;
+}
+
+.marker-canvas {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
 }
 
 .map-overlay {
@@ -282,8 +298,9 @@ button.warn {
   overflow: auto;
   padding: 16px;
   border-radius: 18px;
-  background: rgba(37, 29, 20, 0.9);
-  color: #f7efe2;
+  background: rgba(255, 250, 242, 0.7);
+  border: 1px solid var(--panel-border);
+  color: var(--text);
   font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
   font-size: 13px;
   line-height: 1.55;
@@ -298,9 +315,6 @@ button.warn {
     flex-direction: column;
   }
 
-  .hero-badge {
-    max-width: none;
-  }
 }
 
 @media (max-width: 640px) {
@@ -326,5 +340,9 @@ button.warn {
 
   button {
     width: 100%;
+  }
+
+  .map-shell {
+    min-height: min(58vh, 420px);
   }
 }

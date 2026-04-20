@@ -21,7 +21,7 @@ setup(
     zip_safe=True,
     maintainer="cmls",
     maintainer_email="cmls@todo.todo",
-    description="Web dashboard for controlling navigation, SLAM, and return-home tasks.",
+    description="Web dashboard for controlling SLAM, map preview, and vision tracking.",
     license="TODO: License declaration",
     tests_require=["pytest"],
     entry_points={

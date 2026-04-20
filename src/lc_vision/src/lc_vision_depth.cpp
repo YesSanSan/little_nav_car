@@ -2,6 +2,19 @@
 
 namespace lc_vision {
 
+namespace {
+
+std::string summarizeRawDetection(const Detection &detection) {
+    std::ostringstream stream;
+    stream.setf(std::ios::fixed);
+    stream.precision(3);
+    stream << "label=" << detection.label << " score=" << detection.score << " box=[" << detection.box.x << ","
+           << detection.box.y << "," << detection.box.width << "," << detection.box.height << "]";
+    return stream.str();
+}
+
+} // namespace
+
 cv::Rect LCVision::Impl::scaleRectToSize(
     const cv::Rect &source_box, const cv::Size &source_size, const cv::Size &target_size) const {
     if (source_size.width <= 0 || source_size.height <= 0 || target_size.width <= 0 || target_size.height <= 0) {
@@ -66,6 +79,13 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
 
     const cv::Rect roi = result.debug.depth_roi & cv::Rect(0, 0, depth_size.width, depth_size.height);
     if (roi.width <= 1 || roi.height <= 1) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Depth estimation failed: ROI too small. detection=%s rgb_size=%dx%d depth_size=%dx%d scaled_roi=[%d,%d,%d,%d]",
+                summarizeRawDetection(detection).c_str(), rgb_size.width, rgb_size.height, depth_size.width,
+                depth_size.height, roi.x, roi.y, roi.width, roi.height);
+        }
         return result;
     }
 
@@ -87,6 +107,15 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
 
     result.roi_valid_pixel_count = static_cast<uint32_t>(valid_depths.size());
     if (valid_depths.size() < static_cast<size_t>(std::max(1, depth.estimation.min_valid_pixels))) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Depth estimation failed: insufficient valid depth pixels. detection=%s roi=[%d,%d,%d,%d] valid_px=%u "
+                "min_valid_px=%d depth_range=[%d,%d]",
+                summarizeRawDetection(detection).c_str(), roi.x, roi.y, roi.width, roi.height,
+                result.roi_valid_pixel_count, std::max(1, depth.estimation.min_valid_pixels), depth.roi_min_valid_mm,
+                depth.roi_max_valid_mm);
+        }
         return result;
     }
 
@@ -103,6 +132,13 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
 
     auto peak_it = std::max_element(result.debug.histogram_counts.begin(), result.debug.histogram_counts.end());
     if (peak_it == result.debug.histogram_counts.end() || *peak_it <= 0) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Depth estimation failed: no peak found in histogram. detection=%s roi=[%d,%d,%d,%d] valid_px=%u",
+                summarizeRawDetection(detection).c_str(), roi.x, roi.y, roi.width, roi.height,
+                result.roi_valid_pixel_count);
+        }
         return result;
     }
 
@@ -160,6 +196,15 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
 
     result.peak_pixel_count = static_cast<uint32_t>(peak_depths.size());
     if (peak_depths.size() < static_cast<size_t>(std::max(1, depth.estimation.min_peak_pixels))) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Depth estimation failed: insufficient peak pixels. detection=%s roi=[%d,%d,%d,%d] valid_px=%u peak_px=%u "
+                "min_peak_px=%d peak_range=[%.1f,%.1f]",
+                summarizeRawDetection(detection).c_str(), roi.x, roi.y, roi.width, roi.height,
+                result.roi_valid_pixel_count, result.peak_pixel_count, std::max(1, depth.estimation.min_peak_pixels),
+                static_cast<double>(result.peak_min_mm), static_cast<double>(result.peak_max_mm));
+        }
         return result;
     }
 
@@ -182,11 +227,28 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
     const double sum = std::accumulate(begin_it, end_it, 0.0);
     const size_t keep_count = static_cast<size_t>(std::distance(begin_it, end_it));
     if (keep_count == 0U) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Depth estimation failed: trimmed peak set became empty. detection=%s peak_px=%u trim_ratio=%.3f",
+                summarizeRawDetection(detection).c_str(), result.peak_pixel_count,
+                static_cast<double>(depth.estimation.trim_ratio));
+        }
         return result;
     }
 
     result.depth_mm = static_cast<float>(sum / static_cast<double>(keep_count));
     result.depth_valid = true;
+    if (tracking.debug.enable_verbose_logs) {
+        RCLCPP_INFO(
+            node.get_logger(),
+            "Depth estimation success: detection=%s roi=[%d,%d,%d,%d] valid_px=%u peak_px=%u depth_mm=%.1f "
+            "peak_range=[%.1f,%.1f] peak_centroid=[%.1f,%.1f]",
+            summarizeRawDetection(detection).c_str(), roi.x, roi.y, roi.width, roi.height,
+            result.roi_valid_pixel_count, result.peak_pixel_count, static_cast<double>(result.depth_mm),
+            static_cast<double>(result.peak_min_mm), static_cast<double>(result.peak_max_mm),
+            static_cast<double>(result.peak_centroid_x), static_cast<double>(result.peak_centroid_y));
+    }
     return result;
 }
 

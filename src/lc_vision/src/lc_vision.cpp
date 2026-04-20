@@ -324,6 +324,12 @@ void LCVision::getParams() {
         static_cast<float>(this->declare_parameter<double>("tracking.max_center_distance_px", 120.0));
     impl_->tracking.max_depth_delta_mm =
         static_cast<float>(this->declare_parameter<double>("tracking.max_depth_delta_mm", 800.0));
+    impl_->tracking.debug.enable_verbose_logs =
+        this->declare_parameter<bool>("tracking.debug.enable_verbose_logs", false);
+    impl_->tracking.debug.max_track_memories =
+        this->declare_parameter<int>("tracking.debug.max_track_memories", 32);
+    impl_->tracking.debug.track_memory_timeout_sec =
+        static_cast<float>(this->declare_parameter<double>("tracking.debug.track_memory_timeout_sec", 3.0));
     impl_->tracking.recovery.enable = this->declare_parameter<bool>("tracking.recovery.enable", true);
     impl_->tracking.recovery.cmd_vel_topic =
         this->declare_parameter<std::string>("tracking.recovery.cmd_vel_topic", "/cmd_vel_nav");
@@ -433,11 +439,15 @@ void LCVision::getParams() {
         impl_->depth.camera_point.flip_x ? "true" : "false");
     RCLCPP_INFO(
         get_logger(),
-        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d map_match=[dist=%.2fm angle=%.2frad] min_iou=%.2f max_center=%.1f max_depth_delta=%.1f recovery=%s turn=%.2frad/s reacquire=%.2frad/s visual_servo=%s engage=%.2fm lost=%.2fm",
+        "Tracking config: enable=%s center_gate=%.2f lost_frames=%d map_match=[dist=%.2fm angle=%.2frad] min_iou=%.2f "
+        "max_center=%.1f max_depth_delta=%.1f verbose_logs=%s track_memory=[max=%d timeout=%.2fs] "
+        "recovery=%s turn=%.2frad/s reacquire=%.2frad/s visual_servo=%s engage=%.2fm lost=%.2fm",
         impl_->tracking.enable ? "true" : "false", impl_->tracking.initial_center_gate_ratio,
         impl_->tracking.max_lost_frames, impl_->tracking.map_match.distance_tolerance_m,
         impl_->tracking.map_match.angle_tolerance_rad, impl_->tracking.min_iou_for_match,
         impl_->tracking.max_center_distance_px, impl_->tracking.max_depth_delta_mm,
+        impl_->tracking.debug.enable_verbose_logs ? "true" : "false",
+        impl_->tracking.debug.max_track_memories, impl_->tracking.debug.track_memory_timeout_sec,
         impl_->tracking.recovery.enable ? "true" : "false", impl_->tracking.recovery.turn_speed_rad_s,
         impl_->tracking.recovery.reacquire_turn_speed_rad_s,
         impl_->tracking.visual_servo.enable ? "true" : "false", impl_->tracking.visual_servo.engage_distance_m,
