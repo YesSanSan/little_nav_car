@@ -1,0 +1,13 @@
+std_msgs/Header header
+string label
+int32 track_id
+bool selected
+string depth_quality_state
+bool camera_depth_valid
+float32 camera_depth_mm
+bool control_distance_valid
+float32 control_distance_mm
+float32 roi_invalid_ratio
+uint32 roi_valid_pixel_count
+uint32 roi_invalid_pixel_count
+float32 nearest_valid_depth_mm

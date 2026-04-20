@@ -105,6 +105,7 @@ ament_auto_add_library(${LC_VISION_COMPONENT_TARGET} SHARED
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DetectionDepth.msg"
   "msg/DetectionDepthArray.msg"
+  "msg/SelectedTargetStatus.msg"
   DEPENDENCIES std_msgs geometry_msgs
 )
 

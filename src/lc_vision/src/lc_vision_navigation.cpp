@@ -12,7 +12,11 @@ std::string summarizeDetectionResult(const DetectionDepthResult &result) {
            << result.detection.box.x << "," << result.detection.box.y << "," << result.detection.box.width << ","
            << result.detection.box.height << "] depth_valid=" << (result.depth_valid ? "true" : "false")
            << " depth_mm=" << result.depth_mm << " roi_valid_px=" << result.roi_valid_pixel_count
-           << " peak_px=" << result.peak_pixel_count << " camera_valid="
+           << " roi_invalid_px=" << result.roi_invalid_pixel_count << " roi_invalid_ratio=" << result.roi_invalid_ratio
+           << " nearest_valid_depth_mm=" << result.nearest_valid_depth_mm << " peak_px=" << result.peak_pixel_count
+           << " depth_quality=" << static_cast<int>(result.depth_quality_state)
+           << " control_distance_valid=" << (result.control_distance_valid ? "true" : "false")
+           << " control_distance_mm=" << result.control_distance_mm << " camera_valid="
            << (result.camera_point_valid ? "true" : "false") << " camera_point=["
            << result.camera_point.x << "," << result.camera_point.y << "," << result.camera_point.z << "] track_id="
            << result.track_id << " selected=" << (result.selected ? "true" : "false");
@@ -36,6 +40,20 @@ const char *toString(const RecoveryPhase phase) {
         return "searching";
     case RecoveryPhase::ReacquiredAligning:
         return "reacquired_aligning";
+    }
+    return "unknown";
+}
+
+const char *toString(const DepthQualityState state) {
+    switch (state) {
+    case DepthQualityState::Invalid:
+        return "invalid";
+    case DepthQualityState::Reliable:
+        return "reliable";
+    case DepthQualityState::NearFieldOccluded:
+        return "near_field_occluded";
+    case DepthQualityState::BackgroundSuspect:
+        return "background_suspect";
     }
     return "unknown";
 }
@@ -317,6 +335,89 @@ void LCVision::Impl::handleNavigateToPoseStatus(const action_msgs::msg::GoalStat
     external_navigation_active.store(saw_external_active_goal, std::memory_order_relaxed);
 }
 
+DepthQualityState LCVision::Impl::evaluateSelectedTargetDepthQuality(
+    const DetectionDepthResult &result, const rclcpp::Time &stamp) const {
+    if (!result.depth_valid) {
+        return DepthQualityState::Invalid;
+    }
+
+    if (!depth.estimation.near_field_enable || !remembered_target.reliable_depth_available) {
+        return DepthQualityState::Reliable;
+    }
+
+    const double history_age_sec = (stamp - remembered_target.reliable_depth_stamp).seconds();
+    if (history_age_sec > static_cast<double>(std::max(0.0f, depth.estimation.near_field_history_timeout_sec))) {
+        return DepthQualityState::Reliable;
+    }
+
+    const float history_depth_mm = remembered_target.reliable_depth_m * 1000.0f;
+    if (!std::isfinite(history_depth_mm)) {
+        return DepthQualityState::Reliable;
+    }
+
+    if (history_depth_mm < static_cast<float>(depth.estimation.near_field_min_history_depth_mm) ||
+        history_depth_mm > static_cast<float>(depth.estimation.near_field_max_expected_depth_mm) ||
+        remembered_target.reliable_depth_streak < std::max(1, depth.estimation.near_field_min_reliable_frames)) {
+        return DepthQualityState::Reliable;
+    }
+
+    const bool large_depth_jump =
+        result.depth_mm >= history_depth_mm + static_cast<float>(depth.estimation.near_field_depth_jump_mm);
+    if (!large_depth_jump) {
+        return DepthQualityState::Reliable;
+    }
+
+    const bool high_invalid_ratio =
+        result.roi_invalid_ratio >= std::clamp(depth.estimation.near_field_invalid_ratio_threshold, 0.0f, 1.0f);
+    const bool nearest_valid_still_far =
+        result.nearest_valid_depth_mm <= 0.0f ||
+        result.nearest_valid_depth_mm >=
+            history_depth_mm + static_cast<float>(depth.estimation.near_field_nearest_valid_margin_mm);
+    if (!nearest_valid_still_far) {
+        return DepthQualityState::Reliable;
+    }
+
+    if (high_invalid_ratio) {
+        return DepthQualityState::NearFieldOccluded;
+    }
+
+    return DepthQualityState::BackgroundSuspect;
+}
+
+DepthControlDecision LCVision::Impl::buildDepthControlDecision(
+    const DetectionDepthResult &result, const DepthQualityState quality_state, const rclcpp::Time &stamp) const {
+    DepthControlDecision decision;
+    decision.quality_state = quality_state;
+
+    switch (quality_state) {
+    case DepthQualityState::Reliable:
+        if (result.depth_valid) {
+            decision.control_distance_valid = true;
+            decision.control_distance_m = result.depth_mm / 1000.0f;
+            decision.allow_forward_motion = true;
+        }
+        return decision;
+    case DepthQualityState::NearFieldOccluded:
+    case DepthQualityState::BackgroundSuspect: {
+        const bool have_recent_reliable_depth =
+            remembered_target.reliable_depth_available &&
+            (stamp - remembered_target.reliable_depth_stamp).seconds() <=
+                static_cast<double>(std::max(0.0f, depth.estimation.near_field_history_timeout_sec));
+        if (!have_recent_reliable_depth) {
+            return decision;
+        }
+        decision.control_distance_valid = true;
+        decision.control_distance_m =
+            std::min(remembered_target.reliable_depth_m, std::max(0.0f, goal.standoff_distance_m));
+        decision.allow_forward_motion = false;
+        return decision;
+    }
+    case DepthQualityState::Invalid:
+        return decision;
+    }
+    return decision;
+}
+
 void LCVision::Impl::rememberTargetObservation(
     const DetectionDepthResult &result, const int width, const rclcpp::Time &stamp,
     const std::optional<geometry_msgs::msg::PointStamped> &map_point) {
@@ -325,11 +426,56 @@ void LCVision::Impl::rememberTargetObservation(
     remembered_target.image_offset_px = detectionCenter(result).x - static_cast<float>(width) * 0.5f;
     remembered_target.camera_lateral_m =
         result.camera_point_valid ? static_cast<float>(result.camera_point.x) : 0.0f;
-    remembered_target.depth_m = result.depth_valid ? result.depth_mm / 1000.0f : std::numeric_limits<float>::infinity();
+    remembered_target.last_depth_quality_state = result.depth_quality_state;
+    remembered_target.control_distance_valid = result.control_distance_valid;
+    remembered_target.control_distance_m =
+        result.control_distance_valid ? result.control_distance_mm / 1000.0f : std::numeric_limits<float>::infinity();
+    if (result.depth_quality_state == DepthQualityState::Reliable && result.depth_valid) {
+        remembered_target.reliable_depth_available = true;
+        remembered_target.reliable_depth_stamp = stamp;
+        remembered_target.reliable_depth_m = result.depth_mm / 1000.0f;
+        ++remembered_target.reliable_depth_streak;
+    } else {
+        remembered_target.reliable_depth_streak = 0;
+    }
+    remembered_target.depth_m = result.control_distance_valid
+                                    ? result.control_distance_mm / 1000.0f
+                                    : (remembered_target.reliable_depth_available
+                                           ? remembered_target.reliable_depth_m
+                                           : std::numeric_limits<float>::infinity());
     remembered_target.map_point_valid = map_point.has_value();
     if (map_point.has_value()) {
         remembered_target.map_point = *map_point;
     }
+}
+
+void LCVision::Impl::publishSelectedTargetStatus(
+    const std::optional<DetectionDepthResult> &selected, const rclcpp::Time &stamp) {
+    if (selected_target_status_pub == nullptr) {
+        return;
+    }
+
+    lc_vision::msg::SelectedTargetStatus msg;
+    msg.header.stamp = toBuiltinTime(stamp);
+    msg.header.frame_id = depth.frame_id;
+    msg.track_id = -1;
+    msg.depth_quality_state = "no_target";
+    if (selected.has_value()) {
+        const auto &result = *selected;
+        msg.label = result.detection.label;
+        msg.track_id = result.track_id;
+        msg.selected = result.selected;
+        msg.depth_quality_state = toString(result.depth_quality_state);
+        msg.camera_depth_valid = result.depth_valid;
+        msg.camera_depth_mm = result.depth_mm;
+        msg.control_distance_valid = result.control_distance_valid;
+        msg.control_distance_mm = result.control_distance_mm;
+        msg.roi_invalid_ratio = result.roi_invalid_ratio;
+        msg.roi_valid_pixel_count = result.roi_valid_pixel_count;
+        msg.roi_invalid_pixel_count = result.roi_invalid_pixel_count;
+        msg.nearest_valid_depth_mm = result.nearest_valid_depth_mm;
+    }
+    selected_target_status_pub->publish(msg);
 }
 
 void LCVision::Impl::publishTrackingCommand(const double linear_velocity, const double angular_velocity) {
@@ -432,19 +578,20 @@ bool LCVision::Impl::isTargetAlignedForForwardMotion(const DetectionDepthResult 
 
 bool LCVision::Impl::maybeRunVisualServo(
     const DetectionDepthResult &selected, const int width, const rclcpp::Time &stamp) {
-    if (!tracking.visual_servo.enable || !selected.depth_valid) {
+    if (!tracking.visual_servo.enable || !selected.control_distance_valid) {
         if (visual_servo.active) {
             visual_servo.active = false;
         }
         return false;
     }
 
-    const float target_distance_m = selected.depth_mm / 1000.0f;
+    const float target_distance_m = selected.control_distance_mm / 1000.0f;
     if (!visual_servo.active && target_distance_m <= tracking.visual_servo.engage_distance_m) {
         visual_servo.active = true;
         visual_servo.activation_stamp = stamp;
         RCLCPP_INFO(
-            node.get_logger(), "Entering pure visual tracking mode at %.2fm", static_cast<double>(target_distance_m));
+            node.get_logger(), "Entering pure visual tracking mode at %.2fm (%s)", static_cast<double>(target_distance_m),
+            toString(selected.depth_quality_state));
     }
 
     if (!visual_servo.active) {
@@ -486,7 +633,7 @@ bool LCVision::Impl::maybeRunVisualServo(
     double linear_velocity = 0.0;
     const double distance_error_m =
         static_cast<double>(target_distance_m) - static_cast<double>(goal.standoff_distance_m);
-    if (distance_error_m > 0.0 && aligned_for_forward) {
+    if (selected.depth_quality_state == DepthQualityState::Reliable && distance_error_m > 0.0 && aligned_for_forward) {
         linear_velocity = std::clamp(
             distance_error_m * static_cast<double>(tracking.visual_servo.linear_gain),
             static_cast<double>(tracking.visual_servo.min_linear_speed_m_s),
@@ -508,9 +655,10 @@ bool LCVision::Impl::maybeRunVisualServo(
         RCLCPP_INFO(
             node.get_logger(),
             "Visual servo command: offset_px=%.3f normalized_error=%.3f aligned_for_forward=%s linear=%.3f angular=%.3f "
-            "recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
+            "depth_quality=%s control_distance_m=%.3f recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
             static_cast<double>(offset_px), static_cast<double>(normalized_error),
             aligned_for_forward ? "true" : "false", linear_velocity, angular_velocity,
+            toString(selected.depth_quality_state), static_cast<double>(target_distance_m),
             toString(recovery_rotation.phase), recovery_rotation.direction, allow_recovery_stop ? "true" : "false");
     }
     return true;
@@ -1216,6 +1364,7 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
     std::vector<DetectionDepthResult> &results, const int width, const int height, const rclcpp::Time &stamp) {
     if (!goal_runtime_enabled.load(std::memory_order_relaxed) ||
         !tracking_runtime_enabled.load(std::memory_order_relaxed)) {
+        publishSelectedTargetStatus(std::nullopt, stamp);
         stopTrackingMotion("tracking or goal runtime disabled", true);
         return;
     }
@@ -1229,18 +1378,38 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
                 tracked_target.active ? "true" : "false", tracked_target.current_track_id, tracked_target.stable_frames,
                 tracked_target.lost_frames);
         }
+        publishSelectedTargetStatus(std::nullopt, stamp);
         maybeRecoverLostTarget(results, stamp);
         return;
     }
 
     auto &selected = results[static_cast<size_t>(selected_index)];
+    selected.depth_quality_state = evaluateSelectedTargetDepthQuality(selected, stamp);
+    const auto control_decision = buildDepthControlDecision(selected, selected.depth_quality_state, stamp);
+    selected.control_distance_valid = control_decision.control_distance_valid;
+    selected.control_distance_mm =
+        control_decision.control_distance_valid ? control_decision.control_distance_m * 1000.0f : 0.0f;
+    tracked_target.last_result.depth_quality_state = selected.depth_quality_state;
+    tracked_target.last_result.control_distance_valid = selected.control_distance_valid;
+    tracked_target.last_result.control_distance_mm = selected.control_distance_mm;
     rememberTargetObservation(selected, width, stamp);
+    publishSelectedTargetStatus(std::optional<DetectionDepthResult>(selected), stamp);
     geometry_msgs::msg::PointStamped camera_point;
     camera_point.header.stamp = toBuiltinTime(stamp);
     camera_point.header.frame_id = depth.frame_id;
     camera_point.point = selected.camera_point;
 
     if (tryHandleSelectedTargetWithVisualServo(selected, width, stamp)) {
+        return;
+    }
+
+    if (selected.depth_quality_state != DepthQualityState::Reliable) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Navigation goal suppressed because selected depth is not reliable. depth_quality=%s selected=%s",
+                toString(selected.depth_quality_state), summarizeDetectionResult(selected).c_str());
+        }
         return;
     }
 

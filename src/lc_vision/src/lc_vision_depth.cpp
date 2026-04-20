@@ -90,7 +90,9 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
     }
 
     std::vector<int> valid_depths;
+    result.roi_total_pixel_count = static_cast<uint32_t>(std::max(0, roi.area()));
     valid_depths.reserve(static_cast<size_t>(roi.area()));
+    int nearest_valid_depth_mm = std::numeric_limits<int>::max();
     for (int y = roi.y; y < roi.y + roi.height; ++y) {
         const size_t row_offset = static_cast<size_t>(y) * static_cast<size_t>(depth_size.width);
         for (int x = roi.x; x < roi.x + roi.width; ++x) {
@@ -102,10 +104,21 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
                 continue;
             }
             valid_depths.push_back(depth_mm);
+            nearest_valid_depth_mm = std::min(nearest_valid_depth_mm, depth_mm);
         }
     }
 
     result.roi_valid_pixel_count = static_cast<uint32_t>(valid_depths.size());
+    result.roi_invalid_pixel_count = result.roi_total_pixel_count > result.roi_valid_pixel_count
+                                         ? result.roi_total_pixel_count - result.roi_valid_pixel_count
+                                         : 0U;
+    if (result.roi_total_pixel_count > 0U) {
+        result.roi_invalid_ratio = static_cast<float>(result.roi_invalid_pixel_count) /
+                                   static_cast<float>(result.roi_total_pixel_count);
+    }
+    if (nearest_valid_depth_mm != std::numeric_limits<int>::max()) {
+        result.nearest_valid_depth_mm = static_cast<float>(nearest_valid_depth_mm);
+    }
     if (valid_depths.size() < static_cast<size_t>(std::max(1, depth.estimation.min_valid_pixels))) {
         if (tracking.debug.enable_verbose_logs) {
             RCLCPP_INFO(
@@ -144,6 +157,23 @@ DetectionDepthResult LCVision::Impl::estimateDepthForDetection(
 
     const int   peak_bin = static_cast<int>(std::distance(result.debug.histogram_counts.begin(), peak_it));
     const int   peak_count = *peak_it;
+    result.histogram_peak_count = static_cast<uint32_t>(std::max(0, peak_count));
+    if (result.roi_valid_pixel_count > 0U) {
+        result.histogram_peak_ratio =
+            static_cast<float>(peak_count) / static_cast<float>(result.roi_valid_pixel_count);
+    }
+    for (size_t bin_index = 0; bin_index < result.debug.histogram_counts.size(); ++bin_index) {
+        if (static_cast<int>(bin_index) == peak_bin) {
+            continue;
+        }
+        const int count = result.debug.histogram_counts[bin_index];
+        if (count <= static_cast<int>(result.histogram_second_peak_count)) {
+            continue;
+        }
+        result.histogram_second_peak_count = static_cast<uint32_t>(count);
+        result.histogram_second_peak_depth_mm = static_cast<float>(
+            depth.roi_min_valid_mm + static_cast<int>(bin_index) * bin_size_mm + (bin_size_mm * 0.5f));
+    }
     const float min_ratio = std::clamp(depth.estimation.peak_min_ratio, 0.0f, 1.0f);
     const int   min_count = std::max(1, depth.estimation.peak_min_count);
 

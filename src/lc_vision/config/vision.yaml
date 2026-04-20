@@ -32,6 +32,14 @@
     depth.estimation.peak_min_count: 5
     depth.estimation.min_peak_pixels: 20
     depth.estimation.trim_ratio: 0.1
+    depth.estimation.near_field_enable: true
+    depth.estimation.near_field_min_history_depth_mm: 450
+    depth.estimation.near_field_max_expected_depth_mm: 900
+    depth.estimation.near_field_invalid_ratio_threshold: 0.45
+    depth.estimation.near_field_depth_jump_mm: 350
+    depth.estimation.near_field_nearest_valid_margin_mm: 200
+    depth.estimation.near_field_history_timeout_sec: 1.0
+    depth.estimation.near_field_min_reliable_frames: 2
     depth.estimation.annotate_depth_on_rgb: true
     depth.estimation.annotate_depth_on_depth: true
     depth.debug_marker.enable: true
@@ -84,18 +92,18 @@
     tracking.visual_servo.align_deadband_px: 36.0
     tracking.visual_servo.forward_deadband_px: 20.0
     tracking.visual_servo.align_band_ratio: 0.2
-    tracking.visual_servo.turn_gain: 0.9
-    tracking.visual_servo.min_turn_speed_rad_s: 0.15
-    tracking.visual_servo.max_turn_speed_rad_s: 1.0
+    tracking.visual_servo.turn_gain: 1.7
+    tracking.visual_servo.min_turn_speed_rad_s: 0.3
+    tracking.visual_servo.max_turn_speed_rad_s: 3.0
     tracking.visual_servo.linear_gain: 0.7
-    tracking.visual_servo.min_linear_speed_m_s: 0.08
+    tracking.visual_servo.min_linear_speed_m_s: 0.15
     tracking.visual_servo.max_linear_speed_m_s: 0.3
 
     goal.enable: true
     goal.global_frame_id: map
     goal.robot_frame_id: base_link
     goal.costmap_topic: /global_costmap/costmap_raw
-    goal.standoff_distance_m: 0.7
+    goal.standoff_distance_m: 0.65
     goal.max_target_distance_m: 1.1
     goal.min_stable_frames: 1
     goal.clearance_radius_m: 0.25

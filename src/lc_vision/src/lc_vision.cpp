@@ -40,6 +40,8 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
         detection_qos.reliable();
         impl_->detections_depth_pub =
             create_publisher<lc_vision::msg::DetectionDepthArray>("~/detections_depth", detection_qos);
+        impl_->selected_target_status_pub =
+            create_publisher<lc_vision::msg::SelectedTargetStatus>("~/selected_target_status", detection_qos);
 
         if (impl_->depth.debug_marker.enable) {
             impl_->depth_debug_marker_pub = create_publisher<visualization_msgs::msg::MarkerArray>(
@@ -263,6 +265,22 @@ void LCVision::getParams() {
     impl_->depth.estimation.min_peak_pixels = this->declare_parameter<int>("depth.estimation.min_peak_pixels", 20);
     impl_->depth.estimation.trim_ratio =
         static_cast<float>(this->declare_parameter<double>("depth.estimation.trim_ratio", 0.1));
+    impl_->depth.estimation.near_field_enable =
+        this->declare_parameter<bool>("depth.estimation.near_field_enable", true);
+    impl_->depth.estimation.near_field_min_history_depth_mm =
+        this->declare_parameter<int>("depth.estimation.near_field_min_history_depth_mm", 450);
+    impl_->depth.estimation.near_field_max_expected_depth_mm =
+        this->declare_parameter<int>("depth.estimation.near_field_max_expected_depth_mm", 900);
+    impl_->depth.estimation.near_field_invalid_ratio_threshold = static_cast<float>(
+        this->declare_parameter<double>("depth.estimation.near_field_invalid_ratio_threshold", 0.45));
+    impl_->depth.estimation.near_field_depth_jump_mm =
+        this->declare_parameter<int>("depth.estimation.near_field_depth_jump_mm", 350);
+    impl_->depth.estimation.near_field_nearest_valid_margin_mm =
+        this->declare_parameter<int>("depth.estimation.near_field_nearest_valid_margin_mm", 200);
+    impl_->depth.estimation.near_field_history_timeout_sec = static_cast<float>(
+        this->declare_parameter<double>("depth.estimation.near_field_history_timeout_sec", 1.0));
+    impl_->depth.estimation.near_field_min_reliable_frames =
+        this->declare_parameter<int>("depth.estimation.near_field_min_reliable_frames", 2);
     impl_->depth.estimation.annotate_depth_on_rgb =
         this->declare_parameter<bool>("depth.estimation.annotate_depth_on_rgb", true);
     impl_->depth.estimation.annotate_depth_on_depth =
@@ -427,10 +445,20 @@ void LCVision::getParams() {
         impl_->detector.vulkan_device_index, impl_->detector.cpu_num_threads);
     RCLCPP_INFO(
         get_logger(),
-        "Depth estimation config: min_valid=%d bin=%dmm peak_ratio=%.2f peak_min=%d min_peak=%d trim=%.2f annotate_rgb=%s annotate_depth=%s marker=%s debug_hist=%s debug_peak=%s flip_x=%s",
+        "Depth estimation config: min_valid=%d bin=%dmm peak_ratio=%.2f peak_min=%d min_peak=%d trim=%.2f "
+        "near_field=[enable=%s min_history=%dmm max_expected=%dmm invalid_ratio=%.2f jump=%dmm nearest_margin=%dmm "
+        "timeout=%.2fs min_reliable_frames=%d] annotate_rgb=%s annotate_depth=%s marker=%s debug_hist=%s debug_peak=%s flip_x=%s",
         impl_->depth.estimation.min_valid_pixels, impl_->depth.estimation.histogram_bin_size_mm,
         impl_->depth.estimation.peak_min_ratio, impl_->depth.estimation.peak_min_count,
         impl_->depth.estimation.min_peak_pixels, impl_->depth.estimation.trim_ratio,
+        impl_->depth.estimation.near_field_enable ? "true" : "false",
+        impl_->depth.estimation.near_field_min_history_depth_mm,
+        impl_->depth.estimation.near_field_max_expected_depth_mm,
+        impl_->depth.estimation.near_field_invalid_ratio_threshold,
+        impl_->depth.estimation.near_field_depth_jump_mm,
+        impl_->depth.estimation.near_field_nearest_valid_margin_mm,
+        impl_->depth.estimation.near_field_history_timeout_sec,
+        impl_->depth.estimation.near_field_min_reliable_frames,
         impl_->depth.estimation.annotate_depth_on_rgb ? "true" : "false",
         impl_->depth.estimation.annotate_depth_on_depth ? "true" : "false",
         impl_->depth.debug_marker.enable ? "true" : "false",

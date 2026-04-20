@@ -47,6 +47,7 @@ extern "C" {
 #include <geometry_msgs/msg/twist.hpp>
 #include <lc_vision/msg/detection_depth.hpp>
 #include <lc_vision/msg/detection_depth_array.hpp>
+#include <lc_vision/msg/selected_target_status.hpp>
 #include <nav2_msgs/msg/costmap.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -88,20 +89,38 @@ struct DepthDebugData {
     cv::Rect         depth_roi;
 };
 
+enum class DepthQualityState {
+    Invalid,
+    Reliable,
+    NearFieldOccluded,
+    BackgroundSuspect,
+};
+
 struct DetectionDepthResult {
     Detection                detection;
     bool                     depth_valid = false;
     float                    depth_mm = 0.0f;
     float                    peak_min_mm = 0.0f;
     float                    peak_max_mm = 0.0f;
+    uint32_t                 roi_total_pixel_count = 0;
     uint32_t                 roi_valid_pixel_count = 0;
+    uint32_t                 roi_invalid_pixel_count = 0;
+    float                    roi_invalid_ratio = 0.0f;
     uint32_t                 peak_pixel_count = 0;
+    uint32_t                 histogram_peak_count = 0;
+    float                    histogram_peak_ratio = 0.0f;
+    uint32_t                 histogram_second_peak_count = 0;
+    float                    histogram_second_peak_depth_mm = 0.0f;
+    float                    nearest_valid_depth_mm = 0.0f;
     bool                     camera_point_valid = false;
     geometry_msgs::msg::Point camera_point;
     float                    peak_centroid_x = 0.0f;
     float                    peak_centroid_y = 0.0f;
     int32_t                  track_id = -1;
     bool                     selected = false;
+    DepthQualityState        depth_quality_state = DepthQualityState::Invalid;
+    bool                     control_distance_valid = false;
+    float                    control_distance_mm = 0.0f;
     DepthDebugData           debug;
 };
 
@@ -133,6 +152,14 @@ struct DepthConfig : StreamConfig {
         int   peak_min_count = 5;
         int   min_peak_pixels = 20;
         float trim_ratio = 0.1f;
+        bool  near_field_enable = true;
+        int   near_field_min_history_depth_mm = 450;
+        int   near_field_max_expected_depth_mm = 900;
+        float near_field_invalid_ratio_threshold = 0.45f;
+        int   near_field_depth_jump_mm = 350;
+        int   near_field_nearest_valid_margin_mm = 200;
+        float near_field_history_timeout_sec = 1.0f;
+        int   near_field_min_reliable_frames = 2;
         bool  annotate_depth_on_rgb = true;
         bool  annotate_depth_on_depth = true;
     };
@@ -501,6 +528,20 @@ struct RememberedTargetState {
     float                          image_offset_px = 0.0f;
     float                          camera_lateral_m = 0.0f;
     float                          depth_m = std::numeric_limits<float>::infinity();
+    bool                           reliable_depth_available = false;
+    rclcpp::Time                   reliable_depth_stamp;
+    float                          reliable_depth_m = std::numeric_limits<float>::infinity();
+    int                            reliable_depth_streak = 0;
+    DepthQualityState              last_depth_quality_state = DepthQualityState::Invalid;
+    bool                           control_distance_valid = false;
+    float                          control_distance_m = std::numeric_limits<float>::infinity();
+};
+
+struct DepthControlDecision {
+    DepthQualityState quality_state = DepthQualityState::Invalid;
+    bool              control_distance_valid = false;
+    float             control_distance_m = std::numeric_limits<float>::infinity();
+    bool              allow_forward_motion = false;
 };
 
 struct RecoveryRotationState {
@@ -599,9 +640,14 @@ struct LCVision::Impl {
         const DetectionDepthResult &result, int32_t track_id, const rclcpp::Time &stamp);
     void assignTrackIds(std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
     void handleNavigateToPoseStatus(const action_msgs::msg::GoalStatusArray::SharedPtr msg);
+    DepthQualityState evaluateSelectedTargetDepthQuality(
+        const DetectionDepthResult &result, const rclcpp::Time &stamp) const;
+    DepthControlDecision buildDepthControlDecision(
+        const DetectionDepthResult &result, DepthQualityState quality_state, const rclcpp::Time &stamp) const;
     void rememberTargetObservation(
         const DetectionDepthResult &result, int width, const rclcpp::Time &stamp,
         const std::optional<geometry_msgs::msg::PointStamped> &map_point = std::nullopt);
+    void publishSelectedTargetStatus(const std::optional<DetectionDepthResult> &selected, const rclcpp::Time &stamp);
     void publishTrackingCommand(double linear_velocity, double angular_velocity);
     void stopTrackingMotion(const std::string &reason, bool clear_visual_servo_mode = false);
     void stopRecoveryRotation(const std::string &reason);
@@ -707,6 +753,7 @@ struct LCVision::Impl {
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr depth_histogram_video_pub;
     rclcpp::Publisher<foxglove_msgs::msg::CompressedVideo>::SharedPtr depth_peak_mask_video_pub;
     rclcpp::Publisher<lc_vision::msg::DetectionDepthArray>::SharedPtr detections_depth_pub;
+    rclcpp::Publisher<lc_vision::msg::SelectedTargetStatus>::SharedPtr selected_target_status_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr depth_debug_marker_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr goal_debug_marker_pub;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           recovery_cmd_vel_pub;
