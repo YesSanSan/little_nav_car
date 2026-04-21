@@ -192,7 +192,6 @@ private:
     }
 
     publisher_->publish(output_scan);
-    publishFilterMarkers();
   }
 
   sensor_msgs::msg::LaserScan resampleScanToFixedResolution(
