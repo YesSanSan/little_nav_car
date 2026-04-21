@@ -42,6 +42,8 @@ private:
     uint32_t    baud_rate_;
     int         serial_driver_;
     int         battery_cell_count_ = 0;
+    bool        use_device_timestamp_ = false;
+    int64_t     max_timestamp_skew_ns_ = 100000000;
 
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr                   cmd_vel_sub;
     rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr base_encoder_pub;

@@ -6,7 +6,7 @@
     rgb.width: 640
     rgb.height: 480
     rgb.capture_fps: 15
-    rgb.publish_fps: 10
+    rgb.publish_fps: 6
     rgb.bitrate_kbps: 1200
     rgb.gop_size: 30
     rgb.frame_id: cam_optical_frame
@@ -15,7 +15,7 @@
     depth.width: 640
     depth.height: 480
     depth.capture_fps: 15
-    depth.publish_fps: 8
+    depth.publish_fps: 4
     depth.bitrate_kbps: 500
     depth.gop_size: 24
     depth.frame_id: cam_optical_frame
@@ -42,7 +42,7 @@
     depth.estimation.near_field_min_reliable_frames: 2
     depth.estimation.annotate_depth_on_rgb: true
     depth.estimation.annotate_depth_on_depth: true
-    depth.debug_marker.enable: true
+    depth.debug_marker.enable: false
     depth.debug_marker.topic: ~/depth_debug_marker
     depth.debug_marker.frame_id: base_link
     depth.debug_marker.z: 0.05
@@ -62,7 +62,7 @@
     detector.input_size: 640
     detector.score_threshold: 0.25
     detector.nms_threshold: 0.45
-    detector.fps: 30
+    detector.fps: 10
     detector.vulkan_device_index: 0
     detector.cpu_num_threads: 2
     detector.log_backend_info: true
@@ -112,8 +112,8 @@
     goal.max_backoff_distance_m: 1.5
     goal.lateral_search_step_m: 0.05
     goal.max_lateral_offset_m: 0.4
-    goal.publish_debug_topics: true
-    goal.debug_marker.enable: true
+    goal.publish_debug_topics: false
+    goal.debug_marker.enable: false
     goal.debug_marker.topic: ~/target_map_debug_marker
     goal.debug_marker.frame_id: map
     goal.debug_marker.point_scale: 0.18

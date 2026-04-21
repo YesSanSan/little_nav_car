@@ -177,12 +177,31 @@ void RMSerialDriver::receiveData() {
 
             memcpy(&packet, data.data() + i, sizeof(ReceivePacket));
 
-            int64_t stm32_now_ns = packet.time * 1000;
-            time_offset_ns       = (ros_now_ns - stm32_now_ns) / 10 + time_offset_ns / 10 * 9;
+            const int64_t stm32_now_ns = static_cast<int64_t>(packet.time * 1000ULL);
+            time_offset_ns             = (ros_now_ns - stm32_now_ns) / 10 + time_offset_ns / 10 * 9;
+            int64_t stamp_ns           = ros_now_ns;
+
+            if (use_device_timestamp_) {
+                const int64_t candidate_stamp_ns = stm32_now_ns + time_offset_ns;
+                const int64_t skew_ns =
+                    candidate_stamp_ns >= ros_now_ns ? (candidate_stamp_ns - ros_now_ns) : (ros_now_ns - candidate_stamp_ns);
+
+                if (skew_ns <= max_timestamp_skew_ns_) {
+                    stamp_ns = candidate_stamp_ns;
+                } else {
+                    RCLCPP_WARN_THROTTLE(
+                        get_logger(), *get_clock(), 2000,
+                        "Discarding skewed base controller timestamp. candidate skew=%.1f ms exceeds limit=%.1f ms; "
+                        "using ROS time instead.",
+                        static_cast<double>(skew_ns) / 1.0e6,
+                        static_cast<double>(max_timestamp_skew_ns_) / 1.0e6);
+                    time_offset_ns = ros_now_ns - stm32_now_ns;
+                }
+            }
 
             // std::cout << packet << std::endl;
 
-            base_encoder_msg.header.stamp          = rclcpp::Time(stm32_now_ns + time_offset_ns);
+            base_encoder_msg.header.stamp          = rclcpp::Time(stamp_ns);
             base_encoder_msg.header.frame_id       = "base_link";
             base_encoder_msg.twist.twist.linear.x  = -packet.v;
             base_encoder_msg.twist.twist.angular.z = packet.omega;
@@ -377,6 +396,9 @@ void RMSerialDriver::joy_thread_func() {
 void RMSerialDriver::getParams() {
     try {
         device_name_ = declare_parameter<std::string>("device_name", "");
+        use_device_timestamp_ = declare_parameter<bool>("use_device_timestamp", false);
+        const int max_timestamp_skew_ms = declare_parameter<int>("max_timestamp_skew_ms", 100);
+        max_timestamp_skew_ns_          = static_cast<int64_t>(std::max(1, max_timestamp_skew_ms)) * 1000000LL;
     } catch (rclcpp::ParameterTypeException &ex) {
         RCLCPP_ERROR(get_logger(), "The device name provided was invalid");
         throw ex;
