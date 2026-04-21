@@ -607,6 +607,7 @@ void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
     };
     options.result_callback = [this](const GoalHandleNavigateToPose::WrappedResult &result) {
         impl_->navigation_goal_active.store(false);
+        impl_->tracked_target.goal_dispatched = false;
         {
             std::lock_guard<std::mutex> lock(impl_->current_nav_goal_mutex);
             impl_->current_nav_goal_handle.reset();
