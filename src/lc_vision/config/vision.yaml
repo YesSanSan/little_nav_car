@@ -42,16 +42,16 @@
     depth.estimation.near_field_min_reliable_frames: 2
     depth.estimation.annotate_depth_on_rgb: true
     depth.estimation.annotate_depth_on_depth: true
-    depth.debug_marker.enable: false
+    depth.debug_marker.enable: true
     depth.debug_marker.topic: ~/depth_debug_marker
     depth.debug_marker.frame_id: base_link
     depth.debug_marker.z: 0.05
     depth.debug_marker.line_width: 0.02
     depth.debug_marker.alpha: 0.9
     depth.debug_marker.use_detection_label_ns: true
-    depth.debug_video.histogram.enable: false
+    depth.debug_video.histogram.enable: true
     depth.debug_video.histogram.topic: ~/depth_histogram/video
-    depth.debug_video.peak_mask.enable: false
+    depth.debug_video.peak_mask.enable: true
     depth.debug_video.peak_mask.topic: ~/depth_peak_mask/video
     image.rotation_degrees: 90
 
@@ -117,8 +117,8 @@
     goal.max_backoff_distance_m: 1.5
     goal.lateral_search_step_m: 0.05
     goal.max_lateral_offset_m: 0.4
-    goal.publish_debug_topics: false
-    goal.debug_marker.enable: false
+    goal.publish_debug_topics: true
+    goal.debug_marker.enable: true
     goal.debug_marker.topic: ~/target_map_debug_marker
     goal.debug_marker.frame_id: map
     goal.debug_marker.point_scale: 0.18
