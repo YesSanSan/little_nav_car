@@ -218,6 +218,12 @@ struct TrackingConfig {
         std::string scan_topic = "/scan_filtered";
     };
 
+    struct NavFallbackConfig {
+        bool        enable = true;
+        std::string cmd_vel_topic = "/cmd_vel_nav";
+        float       no_cmd_vel_timeout_sec = 1.5f;
+    };
+
     struct MapMatchConfig {
         float distance_tolerance_m = 0.6f;
         float angle_tolerance_rad = 0.8f;
@@ -261,6 +267,7 @@ struct TrackingConfig {
     float max_center_distance_px = 120.0f;
     float max_depth_delta_mm = 800.0f;
     LidarConfig lidar;
+    NavFallbackConfig nav_fallback;
     MapMatchConfig map_match;
     RecoveryConfig recovery;
     VisualServoConfig visual_servo;
@@ -593,6 +600,12 @@ struct VisualServoState {
     rclcpp::Time activation_stamp;
 };
 
+struct NavFallbackState {
+    bool         active = false;
+    std::string  reason;
+    rclcpp::Time activated_stamp;
+};
+
 struct TrackMemoryState {
     int32_t                        track_id = -1;
     geometry_msgs::msg::PointStamped map_point;
@@ -673,6 +686,11 @@ struct LCVision::Impl {
         const std::optional<geometry_msgs::msg::PointStamped> &map_point = std::nullopt);
     void publishSelectedTargetStatus(const std::optional<DetectionDepthResult> &selected, const rclcpp::Time &stamp);
     void publishTrackingCommand(double linear_velocity, double angular_velocity);
+    void handleNavigationCmdVel(const geometry_msgs::msg::Twist::SharedPtr msg);
+    void activateVisualNavigationFallback(const std::string &reason, const rclcpp::Time &stamp);
+    void clearVisualNavigationFallback(const std::string &reason);
+    bool consumeVisualNavigationFallback();
+    bool maybeHandleNavigationStall(const rclcpp::Time &stamp);
     void stopTrackingMotion(const std::string &reason, bool clear_visual_servo_mode = false);
     void stopRecoveryRotation(const std::string &reason);
     void startRecoveryRotation(int direction, const std::vector<DetectionDepthResult> &results, const rclcpp::Time &stamp);
@@ -791,6 +809,7 @@ struct LCVision::Impl {
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr selected_goal_pose_pub;
     rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr         costmap_sub;
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr     laser_scan_sub;
+    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr       navigation_cmd_vel_sub;
     rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub;
 
     std::thread capture_thread;
@@ -824,11 +843,15 @@ struct LCVision::Impl {
     RememberedTargetState remembered_target;
     RecoveryRotationState recovery_rotation;
     VisualServoState visual_servo;
+    NavFallbackState nav_fallback_state;
     std::vector<TrackMemoryState> track_memories;
     std::atomic<bool> navigation_goal_active{false};
     std::atomic<bool> external_navigation_active{false};
     std::atomic<bool> tracking_runtime_enabled{true};
     std::atomic<bool> goal_runtime_enabled{true};
+    std::mutex        navigation_cmd_vel_mutex;
+    rclcpp::Time      nav_goal_start_stamp;
+    rclcpp::Time      last_navigation_cmd_vel_stamp;
     rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_handle;
     std::mutex current_nav_goal_mutex;
     rclcpp_action::ClientGoalHandle<LCVision::NavigateToPose>::SharedPtr current_nav_goal_handle;

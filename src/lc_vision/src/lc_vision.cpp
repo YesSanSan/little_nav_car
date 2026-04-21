@@ -60,6 +60,14 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 impl_->tracking.recovery.cmd_vel_topic, cmd_qos);
         }
 
+        if (impl_->tracking.nav_fallback.enable && !impl_->tracking.nav_fallback.cmd_vel_topic.empty()) {
+            impl_->navigation_cmd_vel_sub = create_subscription<geometry_msgs::msg::Twist>(
+                impl_->tracking.nav_fallback.cmd_vel_topic, rclcpp::SensorDataQoS(),
+                [impl = impl_.get()](const geometry_msgs::msg::Twist::SharedPtr msg) {
+                    impl->handleNavigationCmdVel(msg);
+                });
+        }
+
         impl_->navigate_to_pose_status_sub = create_subscription<action_msgs::msg::GoalStatusArray>(
             "navigate_to_pose/_action/status", rclcpp::QoS(rclcpp::KeepLast(20)).reliable(),
             [impl = impl_.get()](const action_msgs::msg::GoalStatusArray::SharedPtr msg) {
@@ -353,6 +361,11 @@ void LCVision::getParams() {
     impl_->tracking.lidar.enable = this->declare_parameter<bool>("tracking.lidar.enable", true);
     impl_->tracking.lidar.scan_topic =
         this->declare_parameter<std::string>("tracking.lidar.scan_topic", "/scan_filtered");
+    impl_->tracking.nav_fallback.enable = this->declare_parameter<bool>("tracking.nav_fallback.enable", true);
+    impl_->tracking.nav_fallback.cmd_vel_topic =
+        this->declare_parameter<std::string>("tracking.nav_fallback.cmd_vel_topic", "/cmd_vel_nav");
+    impl_->tracking.nav_fallback.no_cmd_vel_timeout_sec = static_cast<float>(
+        this->declare_parameter<double>("tracking.nav_fallback.no_cmd_vel_timeout_sec", 1.5));
     impl_->tracking.debug.enable_verbose_logs =
         this->declare_parameter<bool>("tracking.debug.enable_verbose_logs", false);
     impl_->tracking.debug.max_track_memories =
@@ -562,12 +575,19 @@ void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
     if (!nav_to_pose_->wait_for_action_server(500ms)) {
         RCLCPP_WARN(get_logger(), "navigate_to_pose action server is not available yet");
         impl_->navigation_goal_active.store(false);
+        impl_->activateVisualNavigationFallback("navigate_to_pose action server unavailable", now());
         return;
     }
 
     NavigateToPose::Goal nav_goal;
     nav_goal.pose = goal;
     impl_->navigation_goal_active.store(true);
+    impl_->clearVisualNavigationFallback("navigation goal dispatched");
+    {
+        std::lock_guard<std::mutex> lock(impl_->navigation_cmd_vel_mutex);
+        impl_->nav_goal_start_stamp = now();
+        impl_->last_navigation_cmd_vel_stamp = rclcpp::Time{};
+    }
 
     using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
     rclcpp_action::Client<NavigateToPose>::SendGoalOptions options;
@@ -575,6 +595,7 @@ void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
         if (!goal_handle) {
             impl_->navigation_goal_active.store(false);
             RCLCPP_WARN(get_logger(), "Navigation goal was rejected by navigate_to_pose");
+            impl_->activateVisualNavigationFallback("navigation goal rejected", now());
             return;
         }
 
@@ -593,15 +614,18 @@ void LCVision::sendGoal(const geometry_msgs::msg::PoseStamped &goal) {
         switch (result.code) {
         case rclcpp_action::ResultCode::SUCCEEDED:
             RCLCPP_INFO(get_logger(), "Navigation goal succeeded");
+            impl_->clearVisualNavigationFallback("navigation goal succeeded");
             break;
         case rclcpp_action::ResultCode::ABORTED:
             RCLCPP_WARN(get_logger(), "Navigation goal aborted");
+            impl_->activateVisualNavigationFallback("navigation goal aborted", now());
             break;
         case rclcpp_action::ResultCode::CANCELED:
             RCLCPP_WARN(get_logger(), "Navigation goal canceled");
             break;
         default:
             RCLCPP_WARN(get_logger(), "Navigation goal returned an unknown result code");
+            impl_->activateVisualNavigationFallback("navigation goal returned unknown result", now());
             break;
         }
     };

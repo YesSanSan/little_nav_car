@@ -489,6 +489,81 @@ void LCVision::Impl::publishTrackingCommand(const double linear_velocity, const 
     recovery_cmd_vel_pub->publish(cmd);
 }
 
+void LCVision::Impl::handleNavigationCmdVel(const geometry_msgs::msg::Twist::SharedPtr) {
+    if (!tracking.nav_fallback.enable || !navigation_goal_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(navigation_cmd_vel_mutex);
+    last_navigation_cmd_vel_stamp = node.now();
+}
+
+void LCVision::Impl::activateVisualNavigationFallback(const std::string &reason, const rclcpp::Time &stamp) {
+    const bool was_active = nav_fallback_state.active;
+    const std::string previous_reason = nav_fallback_state.reason;
+    nav_fallback_state.active = true;
+    nav_fallback_state.reason = reason;
+    nav_fallback_state.activated_stamp = stamp;
+
+    if (!was_active || previous_reason != reason) {
+        RCLCPP_WARN(node.get_logger(), "Activated visual navigation fallback: %s", reason.c_str());
+    }
+}
+
+void LCVision::Impl::clearVisualNavigationFallback(const std::string &reason) {
+    if (!nav_fallback_state.active) {
+        return;
+    }
+
+    nav_fallback_state.active = false;
+    nav_fallback_state.reason.clear();
+    nav_fallback_state.activated_stamp = rclcpp::Time{};
+    RCLCPP_INFO(node.get_logger(), "Cleared visual navigation fallback: %s", reason.c_str());
+}
+
+bool LCVision::Impl::consumeVisualNavigationFallback() {
+    if (!tracking.nav_fallback.enable || !nav_fallback_state.active) {
+        return false;
+    }
+
+    const std::string reason = nav_fallback_state.reason.empty() ? "single-use fallback consumed"
+                                                                 : "single-use fallback consumed: " + nav_fallback_state.reason;
+    clearVisualNavigationFallback(reason);
+    return true;
+}
+
+bool LCVision::Impl::maybeHandleNavigationStall(const rclcpp::Time &stamp) {
+    if (!tracking.nav_fallback.enable || !navigation_goal_active.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    const double timeout_sec = std::max(0.1f, tracking.nav_fallback.no_cmd_vel_timeout_sec);
+    rclcpp::Time goal_start_stamp;
+    rclcpp::Time last_cmd_stamp;
+    {
+        std::lock_guard<std::mutex> lock(navigation_cmd_vel_mutex);
+        goal_start_stamp = nav_goal_start_stamp;
+        last_cmd_stamp = last_navigation_cmd_vel_stamp;
+    }
+
+    if (goal_start_stamp.nanoseconds() <= 0) {
+        return false;
+    }
+
+    const double nav_age_sec = (stamp - goal_start_stamp).seconds();
+    if (nav_age_sec < timeout_sec) {
+        return false;
+    }
+
+    if (last_cmd_stamp.nanoseconds() > 0 && (stamp - last_cmd_stamp).seconds() < timeout_sec) {
+        return false;
+    }
+
+    activateVisualNavigationFallback("navigation stalled without cmd_vel output", stamp);
+    node.cancelCurrentNavigationGoal("navigation stalled without cmd_vel output");
+    return true;
+}
+
 void LCVision::Impl::stopTrackingMotion(const std::string &reason, const bool clear_visual_servo_mode) {
     const bool had_motion = recovery_rotation.isActive() || visual_servo.command_active;
     recovery_rotation.phase = RecoveryPhase::Inactive;
@@ -586,19 +661,22 @@ bool LCVision::Impl::maybeRunVisualServo(
     }
 
     const float target_distance_m = selected.control_distance_mm / 1000.0f;
-    if (!visual_servo.active && target_distance_m <= tracking.visual_servo.engage_distance_m) {
+    const bool force_visual_navigation = consumeVisualNavigationFallback();
+    if (!visual_servo.active &&
+        (force_visual_navigation || target_distance_m <= tracking.visual_servo.engage_distance_m)) {
         visual_servo.active = true;
         visual_servo.activation_stamp = stamp;
         RCLCPP_INFO(
-            node.get_logger(), "Entering pure visual tracking mode at %.2fm (%s)", static_cast<double>(target_distance_m),
-            toString(selected.depth_quality_state));
+            node.get_logger(), "Entering pure visual tracking mode at %.2fm (%s)%s",
+            static_cast<double>(target_distance_m), toString(selected.depth_quality_state),
+            force_visual_navigation ? " via navigation fallback" : "");
     }
 
     if (!visual_servo.active) {
         return false;
     }
 
-    if (target_distance_m > tracking.visual_servo.lost_target_distance_m) {
+    if (!force_visual_navigation && target_distance_m > tracking.visual_servo.lost_target_distance_m) {
         stopTrackingMotion("visual target moved beyond visual-servo range", true);
         return false;
     }
@@ -659,12 +737,13 @@ bool LCVision::Impl::maybeRunVisualServo(
             node.get_logger(),
             "Visual servo command: offset_px=%.3f normalized_error=%.3f aligned_for_forward=%s linear=%.3f angular=%.3f "
             "depth_quality=%s control_distance_m=%.3f forward_blocked=%s target_forward_limit_m=%.3f scan_available=%s "
-            "nearest_obstacle_x_m=%.3f recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
+            "nearest_obstacle_x_m=%.3f fallback_active=%s recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
             static_cast<double>(offset_px), static_cast<double>(normalized_error),
             aligned_for_forward ? "true" : "false", linear_velocity, angular_velocity,
             toString(selected.depth_quality_state), static_cast<double>(target_distance_m),
             forward_blocked ? "true" : "false", static_cast<double>(forward_safety.target_forward_limit_m),
             forward_safety.scan_available ? "true" : "false", static_cast<double>(forward_safety.nearest_obstacle_x_m),
+            force_visual_navigation ? "true" : "false",
             toString(recovery_rotation.phase), recovery_rotation.direction, allow_recovery_stop ? "true" : "false");
     }
     return true;
@@ -1468,6 +1547,8 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
         return;
     }
 
+    maybeHandleNavigationStall(stamp);
+
     const int selected_index = selectTrackedDetection(results, width, height, stamp);
     if (selected_index < 0) {
         if (tracking.debug.enable_verbose_logs) {
@@ -1522,6 +1603,13 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
 
     if (visual_servo.command_active) {
         stopTrackingMotion("falling back to navigation-guided tracking", false);
+    }
+
+    if (!goal_pose.has_value()) {
+        activateVisualNavigationFallback("no safe navigation goal for selected target", stamp);
+        if (tryHandleSelectedTargetWithVisualServo(selected, width, stamp)) {
+            return;
+        }
     }
 
     if (!goal_pose.has_value() || tracked_target.goal_dispatched || tracked_target.stable_frames < goal.min_stable_frames ||

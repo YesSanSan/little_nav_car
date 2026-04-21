@@ -78,6 +78,9 @@
     tracking.max_depth_delta_mm: 800.0
     tracking.lidar.enable: true
     tracking.lidar.scan_topic: /scan_filtered
+    tracking.nav_fallback.enable: true
+    tracking.nav_fallback.cmd_vel_topic: /cmd_vel_nav
+    tracking.nav_fallback.no_cmd_vel_timeout_sec: 1.5
     tracking.debug.enable_verbose_logs: false
     tracking.debug.max_track_memories: 32
     tracking.debug.track_memory_timeout_sec: 3.0
