@@ -633,7 +633,10 @@ bool LCVision::Impl::maybeRunVisualServo(
     double linear_velocity = 0.0;
     const double distance_error_m =
         static_cast<double>(target_distance_m) - static_cast<double>(goal.standoff_distance_m);
-    if (selected.depth_quality_state == DepthQualityState::Reliable && distance_error_m > 0.0 && aligned_for_forward) {
+    const auto forward_safety = evaluateForwardSafety(selected, stamp);
+    const bool forward_blocked = forward_safety.blocked;
+    if (selected.depth_quality_state == DepthQualityState::Reliable && distance_error_m > 0.0 && aligned_for_forward &&
+        !forward_blocked) {
         linear_velocity = std::clamp(
             distance_error_m * static_cast<double>(tracking.visual_servo.linear_gain),
             static_cast<double>(tracking.visual_servo.min_linear_speed_m_s),
@@ -655,10 +658,13 @@ bool LCVision::Impl::maybeRunVisualServo(
         RCLCPP_INFO(
             node.get_logger(),
             "Visual servo command: offset_px=%.3f normalized_error=%.3f aligned_for_forward=%s linear=%.3f angular=%.3f "
-            "depth_quality=%s control_distance_m=%.3f recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
+            "depth_quality=%s control_distance_m=%.3f forward_blocked=%s target_forward_limit_m=%.3f scan_available=%s "
+            "nearest_obstacle_x_m=%.3f recovery_phase=%s recovery_direction=%d allow_recovery_stop=%s",
             static_cast<double>(offset_px), static_cast<double>(normalized_error),
             aligned_for_forward ? "true" : "false", linear_velocity, angular_velocity,
             toString(selected.depth_quality_state), static_cast<double>(target_distance_m),
+            forward_blocked ? "true" : "false", static_cast<double>(forward_safety.target_forward_limit_m),
+            forward_safety.scan_available ? "true" : "false", static_cast<double>(forward_safety.nearest_obstacle_x_m),
             toString(recovery_rotation.phase), recovery_rotation.direction, allow_recovery_stop ? "true" : "false");
     }
     return true;
@@ -1057,6 +1063,22 @@ bool LCVision::Impl::copyLatestCostmap(nav2_msgs::msg::Costmap &costmap) const {
     return true;
 }
 
+void LCVision::Impl::storeLaserScan(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(laser_scan_cache.mutex);
+    laser_scan_cache.scan = *msg;
+    laser_scan_cache.available = true;
+}
+
+bool LCVision::Impl::copyLatestLaserScan(sensor_msgs::msg::LaserScan &scan) const {
+    std::lock_guard<std::mutex> lock(laser_scan_cache.mutex);
+    if (!laser_scan_cache.available) {
+        return false;
+    }
+
+    scan = laser_scan_cache.scan;
+    return true;
+}
+
 bool LCVision::Impl::transformPointToFrame(
     const geometry_msgs::msg::PointStamped &input, const std::string &target_frame,
     geometry_msgs::msg::PointStamped &output) const {
@@ -1069,6 +1091,83 @@ bool LCVision::Impl::transformPointToFrame(
             input.header.frame_id.c_str(), target_frame.c_str(), ex.what());
         return false;
     }
+}
+
+ForwardSafetyDecision LCVision::Impl::evaluateForwardSafety(
+    const DetectionDepthResult &selected, const rclcpp::Time &stamp) const {
+    ForwardSafetyDecision decision;
+    if (!tracking.lidar.enable || !selected.camera_point_valid) {
+        return decision;
+    }
+
+    geometry_msgs::msg::PointStamped camera_point;
+    camera_point.header.stamp = toBuiltinTime(stamp);
+    camera_point.header.frame_id = depth.frame_id;
+    camera_point.point = selected.camera_point;
+
+    geometry_msgs::msg::PointStamped base_point;
+    if (!transformPointToFrame(camera_point, goal.robot_frame_id, base_point)) {
+        return decision;
+    }
+
+    decision.target_distance_valid = true;
+    decision.target_forward_limit_m =
+        std::max(0.0f, static_cast<float>(base_point.point.x) - goal.standoff_distance_m);
+    if (decision.target_forward_limit_m <= 1.0e-3f) {
+        return decision;
+    }
+
+    sensor_msgs::msg::LaserScan scan;
+    if (!copyLatestLaserScan(scan)) {
+        return decision;
+    }
+    decision.scan_available = true;
+
+    geometry_msgs::msg::TransformStamped transform;
+    try {
+        transform = tf_buffer->lookupTransform(
+            goal.robot_frame_id, scan.header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.05));
+    } catch (const tf2::TransformException &ex) {
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000, "Failed to transform lidar scan from %s to %s: %s",
+            scan.header.frame_id.c_str(), goal.robot_frame_id.c_str(), ex.what());
+        return decision;
+    }
+
+    const tf2::Quaternion rotation_quaternion(
+        transform.transform.rotation.x, transform.transform.rotation.y, transform.transform.rotation.z,
+        transform.transform.rotation.w);
+    const tf2::Matrix3x3 rotation(rotation_quaternion);
+    const tf2::Vector3 translation(
+        transform.transform.translation.x, transform.transform.translation.y, transform.transform.translation.z);
+
+    const float half_width_m = std::max(0.05f, goal.clearance_radius_m);
+    for (size_t index = 0; index < scan.ranges.size(); ++index) {
+        const float range = scan.ranges[index];
+        if (!std::isfinite(range) || range < scan.range_min || range > scan.range_max) {
+            continue;
+        }
+
+        const double angle =
+            static_cast<double>(scan.angle_min) + static_cast<double>(index) * static_cast<double>(scan.angle_increment);
+        const tf2::Vector3 point_in_scan(
+            static_cast<double>(range) * std::cos(angle), static_cast<double>(range) * std::sin(angle), 0.0);
+        const tf2::Vector3 point_in_base = rotation * point_in_scan + translation;
+
+        const float point_x_m = static_cast<float>(point_in_base.x());
+        const float point_y_m = static_cast<float>(point_in_base.y());
+        if (point_x_m < 0.0f || point_x_m > decision.target_forward_limit_m) {
+            continue;
+        }
+        if (std::abs(point_y_m) > half_width_m) {
+            continue;
+        }
+
+        decision.blocked = true;
+        decision.nearest_obstacle_x_m = std::min(decision.nearest_obstacle_x_m, point_x_m);
+    }
+
+    return decision;
 }
 
 bool LCVision::Impl::worldToCostmapCell(

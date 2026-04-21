@@ -76,6 +76,8 @@
     tracking.min_iou_for_match: 0.05
     tracking.max_center_distance_px: 120.0
     tracking.max_depth_delta_mm: 800.0
+    tracking.lidar.enable: true
+    tracking.lidar.scan_topic: /scan_filtered
     tracking.debug.enable_verbose_logs: false
     tracking.debug.max_track_memories: 32
     tracking.debug.track_memory_timeout_sec: 3.0

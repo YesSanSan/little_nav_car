@@ -55,8 +55,12 @@ extern "C" {
 #include <rclcpp/node_interfaces/node_parameters_interface.hpp>
 #include <rclcpp/parameter.hpp>
 #include <rclcpp/qos.hpp>
+#include <sensor_msgs/msg/laser_scan.hpp>
 #include <std_msgs/msg/header.hpp>
+#include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <tf2/time.hpp>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -209,6 +213,11 @@ struct DetectorConfig {
 };
 
 struct TrackingConfig {
+    struct LidarConfig {
+        bool        enable = true;
+        std::string scan_topic = "/scan_filtered";
+    };
+
     struct MapMatchConfig {
         float distance_tolerance_m = 0.6f;
         float angle_tolerance_rad = 0.8f;
@@ -251,6 +260,7 @@ struct TrackingConfig {
     float min_iou_for_match = 0.05f;
     float max_center_distance_px = 120.0f;
     float max_depth_delta_mm = 800.0f;
+    LidarConfig lidar;
     MapMatchConfig map_match;
     RecoveryConfig recovery;
     VisualServoConfig visual_servo;
@@ -501,6 +511,12 @@ struct CostmapCache {
     bool                    available = false;
 };
 
+struct LaserScanCache {
+    mutable std::mutex          mutex;
+    sensor_msgs::msg::LaserScan scan;
+    bool                        available = false;
+};
+
 struct TrackedTargetState {
     bool                 active = false;
     int32_t              current_track_id = -1;
@@ -542,6 +558,14 @@ struct DepthControlDecision {
     bool              control_distance_valid = false;
     float             control_distance_m = std::numeric_limits<float>::infinity();
     bool              allow_forward_motion = false;
+};
+
+struct ForwardSafetyDecision {
+    bool  target_distance_valid = false;
+    float target_forward_limit_m = 0.0f;
+    bool  scan_available = false;
+    bool  blocked = false;
+    float nearest_obstacle_x_m = std::numeric_limits<float>::infinity();
 };
 
 struct RecoveryRotationState {
@@ -667,9 +691,13 @@ struct LCVision::Impl {
         std::vector<DetectionDepthResult> &results, int width, int height, const rclcpp::Time &stamp);
     void storeCostmap(const nav2_msgs::msg::Costmap::SharedPtr msg);
     bool copyLatestCostmap(nav2_msgs::msg::Costmap &costmap) const;
+    void storeLaserScan(const sensor_msgs::msg::LaserScan::SharedPtr msg);
+    bool copyLatestLaserScan(sensor_msgs::msg::LaserScan &scan) const;
     bool transformPointToFrame(
         const geometry_msgs::msg::PointStamped &input, const std::string &target_frame,
         geometry_msgs::msg::PointStamped &output) const;
+    ForwardSafetyDecision evaluateForwardSafety(
+        const DetectionDepthResult &selected, const rclcpp::Time &stamp) const;
     bool worldToCostmapCell(
         const nav2_msgs::msg::Costmap &costmap, double world_x, double world_y, int &cell_x, int &cell_y) const;
     bool isFreeCost(uint8_t cost) const;
@@ -739,6 +767,7 @@ struct LCVision::Impl {
     FrameBuffer<uint8_t> depth_peak_mask_buffer;
     DetectionCache       detection_cache;
     CostmapCache         costmap_cache;
+    LaserScanCache       laser_scan_cache;
 
     VideoEncoder rgb_encoder;
     VideoEncoder depth_encoder;
@@ -761,6 +790,7 @@ struct LCVision::Impl {
     rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr selected_target_map_point_pub;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr selected_goal_pose_pub;
     rclcpp::Subscription<nav2_msgs::msg::Costmap>::SharedPtr         costmap_sub;
+    rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr     laser_scan_sub;
     rclcpp::Subscription<action_msgs::msg::GoalStatusArray>::SharedPtr navigate_to_pose_status_sub;
 
     std::thread capture_thread;

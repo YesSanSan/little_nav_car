@@ -83,6 +83,14 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
                 });
         }
 
+        if (impl_->tracking.lidar.enable && !impl_->tracking.lidar.scan_topic.empty()) {
+            impl_->laser_scan_sub = create_subscription<sensor_msgs::msg::LaserScan>(
+                impl_->tracking.lidar.scan_topic, rclcpp::SensorDataQoS(),
+                [impl = impl_.get()](const sensor_msgs::msg::LaserScan::SharedPtr msg) {
+                    impl->storeLaserScan(msg);
+                });
+        }
+
         if (impl_->rgb.enable) {
             auto color_stream = impl_->reader.stream<astra::ColorStream>();
             if (!color_stream.is_available()) {
@@ -342,6 +350,9 @@ void LCVision::getParams() {
         static_cast<float>(this->declare_parameter<double>("tracking.max_center_distance_px", 120.0));
     impl_->tracking.max_depth_delta_mm =
         static_cast<float>(this->declare_parameter<double>("tracking.max_depth_delta_mm", 800.0));
+    impl_->tracking.lidar.enable = this->declare_parameter<bool>("tracking.lidar.enable", true);
+    impl_->tracking.lidar.scan_topic =
+        this->declare_parameter<std::string>("tracking.lidar.scan_topic", "/scan_filtered");
     impl_->tracking.debug.enable_verbose_logs =
         this->declare_parameter<bool>("tracking.debug.enable_verbose_logs", false);
     impl_->tracking.debug.max_track_memories =
