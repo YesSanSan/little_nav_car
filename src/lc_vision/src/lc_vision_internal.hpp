@@ -216,6 +216,7 @@ struct TrackingConfig {
     struct LidarConfig {
         bool        enable = true;
         std::string scan_topic = "/scan_filtered";
+        float       min_forward_protection_m = 0.80f;
     };
 
     struct NavFallbackConfig {

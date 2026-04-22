@@ -361,6 +361,8 @@ void LCVision::getParams() {
     impl_->tracking.lidar.enable = this->declare_parameter<bool>("tracking.lidar.enable", true);
     impl_->tracking.lidar.scan_topic =
         this->declare_parameter<std::string>("tracking.lidar.scan_topic", "/scan_filtered");
+    impl_->tracking.lidar.min_forward_protection_m = static_cast<float>(
+        this->declare_parameter<double>("tracking.lidar.min_forward_protection_m", 0.80));
     impl_->tracking.nav_fallback.enable = this->declare_parameter<bool>("tracking.nav_fallback.enable", true);
     impl_->tracking.nav_fallback.cmd_vel_topic =
         this->declare_parameter<std::string>("tracking.nav_fallback.cmd_vel_topic", "/cmd_vel_nav");

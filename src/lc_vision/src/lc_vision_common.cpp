@@ -580,6 +580,7 @@ LCVision::Impl::Impl(LCVision &owner)
       tf_listener(std::make_shared<tf2_ros::TransformListener>(
           *tf_buffer, owner.get_node_base_interface(), owner.get_node_logging_interface(),
           owner.get_node_parameters_interface(), owner.get_node_topics_interface(), false)) {
+    tf_buffer->setUsingDedicatedThread(true);
 }
 
 fs::path LCVision::Impl::resolveModelDirectory(const DetectorBackend &backend) const {
