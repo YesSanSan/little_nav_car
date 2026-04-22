@@ -1174,6 +1174,8 @@ bool LCVision::Impl::transformPointToFrame(
 
 ForwardSafetyDecision LCVision::Impl::evaluateForwardSafety(
     const DetectionDepthResult &selected, const rclcpp::Time &stamp) const {
+    constexpr double kMaxSafeScanAgeSec = 0.30;
+
     ForwardSafetyDecision decision;
     if (!tracking.lidar.enable || !selected.camera_point_valid) {
         return decision;
@@ -1186,29 +1188,54 @@ ForwardSafetyDecision LCVision::Impl::evaluateForwardSafety(
 
     geometry_msgs::msg::PointStamped base_point;
     if (!transformPointToFrame(camera_point, goal.robot_frame_id, base_point)) {
-        return decision;
+        geometry_msgs::msg::PointStamped latest_camera_point = camera_point;
+        latest_camera_point.header.stamp = builtin_interfaces::msg::Time{};
+        if (!transformPointToFrame(latest_camera_point, goal.robot_frame_id, base_point)) {
+            decision.blocked = true;
+            RCLCPP_WARN_THROTTLE(
+                node.get_logger(), *node.get_clock(), 2000,
+                "Forward lidar safety fell back to stop because target point could not transform to %s",
+                goal.robot_frame_id.c_str());
+            return decision;
+        }
     }
 
     decision.target_distance_valid = true;
+    const float min_forward_protection_m = std::max(0.0f, tracking.lidar.min_forward_protection_m);
     decision.target_forward_limit_m =
-        std::max(0.0f, static_cast<float>(base_point.point.x) - goal.standoff_distance_m);
+        std::max(min_forward_protection_m, std::max(0.0f, static_cast<float>(base_point.point.x) - goal.standoff_distance_m));
     if (decision.target_forward_limit_m <= 1.0e-3f) {
         return decision;
     }
 
     sensor_msgs::msg::LaserScan scan;
     if (!copyLatestLaserScan(scan)) {
+        decision.blocked = true;
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000,
+            "Forward lidar safety fell back to stop because no laser scan is available on %s",
+            tracking.lidar.scan_topic.c_str());
         return decision;
     }
     decision.scan_available = true;
+    if ((stamp - rclcpp::Time(scan.header.stamp)).seconds() > kMaxSafeScanAgeSec) {
+        decision.blocked = true;
+        RCLCPP_WARN_THROTTLE(
+            node.get_logger(), *node.get_clock(), 2000,
+            "Forward lidar safety fell back to stop because scan age %.3fs exceeds %.3fs",
+            (stamp - rclcpp::Time(scan.header.stamp)).seconds(), kMaxSafeScanAgeSec);
+        return decision;
+    }
 
     geometry_msgs::msg::TransformStamped transform;
     try {
         transform = tf_buffer->lookupTransform(
             goal.robot_frame_id, scan.header.frame_id, tf2::TimePointZero, tf2::durationFromSec(0.05));
     } catch (const tf2::TransformException &ex) {
+        decision.blocked = true;
         RCLCPP_WARN_THROTTLE(
-            node.get_logger(), *node.get_clock(), 2000, "Failed to transform lidar scan from %s to %s: %s",
+            node.get_logger(), *node.get_clock(), 2000,
+            "Forward lidar safety fell back to stop because scan transform from %s to %s failed: %s",
             scan.header.frame_id.c_str(), goal.robot_frame_id.c_str(), ex.what());
         return decision;
     }
