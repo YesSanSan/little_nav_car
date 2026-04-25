@@ -79,7 +79,7 @@
     tracking.lidar.enable: true
     tracking.lidar.scan_topic: /scan_filtered
     tracking.lidar.min_forward_protection_m: 0.50
-    tracking.nav_fallback.enable: true
+    tracking.nav_fallback.enable: false
     tracking.nav_fallback.cmd_vel_topic: /cmd_vel_nav
     tracking.nav_fallback.no_cmd_vel_timeout_sec: 1.5
     tracking.debug.enable_verbose_logs: false
@@ -93,8 +93,8 @@
     tracking.recovery.memory_timeout_sec: 5.0
     tracking.recovery.search_timeout_sec: 10.0
     tracking.visual_servo.enable: true
-    tracking.visual_servo.engage_distance_m: 1.1
-    tracking.visual_servo.lost_target_distance_m: 1.8
+    tracking.visual_servo.engage_distance_m: 99.0
+    tracking.visual_servo.lost_target_distance_m: 99.0
     tracking.visual_servo.align_deadband_px: 36.0
     tracking.visual_servo.forward_deadband_px: 20.0
     tracking.visual_servo.align_band_ratio: 0.2
