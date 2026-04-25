@@ -408,7 +408,11 @@ DepthControlDecision LCVision::Impl::buildDepthControlDecision(
         }
         decision.control_distance_valid = true;
         decision.control_distance_m =
-            std::min(remembered_target.reliable_depth_m, std::max(0.0f, goal.standoff_distance_m));
+            std::min(
+                remembered_target.reliable_depth_m,
+                static_cast<float>(std::max(
+                    0.0,
+                    goal_standoff_distance_runtime_m.load(std::memory_order_relaxed))));
         decision.allow_forward_motion = false;
         return decision;
     }
@@ -662,8 +666,9 @@ bool LCVision::Impl::maybeRunVisualServo(
 
     const float target_distance_m = selected.control_distance_mm / 1000.0f;
     const bool force_visual_navigation = consumeVisualNavigationFallback();
+    const bool nav_goal_enabled = nav_goal_runtime_enabled.load(std::memory_order_relaxed);
     if (!visual_servo.active &&
-        (force_visual_navigation || target_distance_m <= tracking.visual_servo.engage_distance_m)) {
+        (!nav_goal_enabled || force_visual_navigation || target_distance_m <= tracking.visual_servo.engage_distance_m)) {
         visual_servo.active = true;
         visual_servo.activation_stamp = stamp;
         RCLCPP_INFO(
@@ -676,7 +681,7 @@ bool LCVision::Impl::maybeRunVisualServo(
         return false;
     }
 
-    if (!force_visual_navigation && target_distance_m > tracking.visual_servo.lost_target_distance_m) {
+    if (nav_goal_enabled && !force_visual_navigation && target_distance_m > tracking.visual_servo.lost_target_distance_m) {
         stopTrackingMotion("visual target moved beyond visual-servo range", true);
         return false;
     }
@@ -709,8 +714,9 @@ bool LCVision::Impl::maybeRunVisualServo(
     }
 
     double linear_velocity = 0.0;
+    const double standoff_distance_m = goal_standoff_distance_runtime_m.load(std::memory_order_relaxed);
     const double distance_error_m =
-        static_cast<double>(target_distance_m) - static_cast<double>(goal.standoff_distance_m);
+        static_cast<double>(target_distance_m) - standoff_distance_m;
     const auto forward_safety = evaluateForwardSafety(selected, stamp);
     const bool forward_blocked = forward_safety.blocked;
     if (selected.depth_quality_state == DepthQualityState::Reliable && distance_error_m > 0.0 && aligned_for_forward &&
@@ -1201,9 +1207,13 @@ ForwardSafetyDecision LCVision::Impl::evaluateForwardSafety(
     }
 
     decision.target_distance_valid = true;
-    const float min_forward_protection_m = std::max(0.0f, tracking.lidar.min_forward_protection_m);
+    const float min_forward_protection_m = static_cast<float>(std::max(
+        0.0, lidar_min_forward_protection_runtime_m.load(std::memory_order_relaxed)));
+    const float standoff_distance_m = static_cast<float>(goal_standoff_distance_runtime_m.load(std::memory_order_relaxed));
     decision.target_forward_limit_m =
-        std::max(min_forward_protection_m, std::max(0.0f, static_cast<float>(base_point.point.x) - goal.standoff_distance_m));
+        std::max(
+            min_forward_protection_m,
+            std::max(0.0f, static_cast<float>(base_point.point.x) - standoff_distance_m));
     if (decision.target_forward_limit_m <= 1.0e-3f) {
         return decision;
     }
@@ -1386,7 +1396,8 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
     const double delta_x = target_costmap_point.point.x - robot_map_point.point.x;
     const double delta_y = target_costmap_point.point.y - robot_map_point.point.y;
     const double distance = std::hypot(delta_x, delta_y);
-    if (distance <= static_cast<double>(goal.standoff_distance_m)) {
+    const double standoff_distance_m = goal_standoff_distance_runtime_m.load(std::memory_order_relaxed);
+    if (distance <= standoff_distance_m) {
         return std::nullopt;
     }
 
@@ -1395,7 +1406,7 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
     const double lateral_x = -dir_y;
     const double lateral_y = dir_x;
     const double max_target_distance = std::max(
-        static_cast<double>(goal.standoff_distance_m), static_cast<double>(goal.max_target_distance_m));
+        standoff_distance_m, static_cast<double>(goal.max_target_distance_m));
     const int    lateral_steps = std::max(
         0, static_cast<int>(std::floor(goal.max_lateral_offset_m / std::max(goal.lateral_search_step_m, 1.0e-3f))));
 
@@ -1428,7 +1439,7 @@ std::optional<geometry_msgs::msg::PoseStamped> LCVision::Impl::buildSafeGoalPose
 
     const auto search_candidates =
         [&](const bool require_ray_free) -> std::optional<geometry_msgs::msg::PoseStamped> {
-        for (double backoff = goal.standoff_distance_m; backoff <= max_target_distance + 1.0e-6;
+        for (double backoff = standoff_distance_m; backoff <= max_target_distance + 1.0e-6;
              backoff += std::max(goal.longitudinal_search_step_m, 1.0e-3f)) {
             if (const auto center_pose = try_candidate(backoff, 0.0, require_ray_free); center_pose.has_value()) {
                 return center_pose;
@@ -1607,6 +1618,16 @@ void LCVision::Impl::maybeDispatchNavigationGoal(
     camera_point.point = selected.camera_point;
 
     if (tryHandleSelectedTargetWithVisualServo(selected, width, stamp)) {
+        return;
+    }
+
+    if (!nav_goal_runtime_enabled.load(std::memory_order_relaxed)) {
+        if (tracking.debug.enable_verbose_logs) {
+            RCLCPP_INFO(
+                node.get_logger(),
+                "Navigation goal suppressed because tracking.nav_goal.enable is false. selected=%s",
+                summarizeDetectionResult(selected).c_str());
+        }
         return;
     }
 

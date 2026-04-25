@@ -10,11 +10,13 @@ from launch_ros.actions import Node
 def generate_launch_description():
     default_workspace = os.environ.get("LITTLE_NAV_CAR_WS", str(Path.cwd()))
     default_state_file = str(Path.home() / ".little_nav_car" / "web_control" / "return_pose.json")
+    default_settings_file = str(Path(default_workspace) / "build" / "lc_web_control" / "web_vision_settings.json")
 
     bind_host = LaunchConfiguration("bind_host")
     port = LaunchConfiguration("port")
     workspace_dir = LaunchConfiguration("workspace_dir")
     state_file = LaunchConfiguration("state_file")
+    settings_file = LaunchConfiguration("settings_file")
 
     return LaunchDescription(
         [
@@ -38,6 +40,11 @@ def generate_launch_description():
                 default_value=default_state_file,
                 description="Path used to persist the marked return-home pose",
             ),
+            DeclareLaunchArgument(
+                "settings_file",
+                default_value=default_settings_file,
+                description="Path used to persist web-adjustable vision settings",
+            ),
             Node(
                 package="lc_web_control",
                 executable="web_control",
@@ -49,6 +56,7 @@ def generate_launch_description():
                         "port": port,
                         "workspace_dir": workspace_dir,
                         "state_file": state_file,
+                        "settings_file": settings_file,
                     }
                 ],
             ),

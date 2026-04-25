@@ -225,6 +225,10 @@ struct TrackingConfig {
         float       no_cmd_vel_timeout_sec = 1.5f;
     };
 
+    struct NavGoalConfig {
+        bool enable = true;
+    };
+
     struct MapMatchConfig {
         float distance_tolerance_m = 0.6f;
         float angle_tolerance_rad = 0.8f;
@@ -269,6 +273,7 @@ struct TrackingConfig {
     float max_depth_delta_mm = 800.0f;
     LidarConfig lidar;
     NavFallbackConfig nav_fallback;
+    NavGoalConfig nav_goal;
     MapMatchConfig map_match;
     RecoveryConfig recovery;
     VisualServoConfig visual_servo;
@@ -850,6 +855,9 @@ struct LCVision::Impl {
     std::atomic<bool> external_navigation_active{false};
     std::atomic<bool> tracking_runtime_enabled{true};
     std::atomic<bool> goal_runtime_enabled{true};
+    std::atomic<bool> nav_goal_runtime_enabled{true};
+    std::atomic<double> goal_standoff_distance_runtime_m{0.5};
+    std::atomic<double> lidar_min_forward_protection_runtime_m{0.8};
     std::mutex        navigation_cmd_vel_mutex;
     rclcpp::Time      nav_goal_start_stamp;
     rclcpp::Time      last_navigation_cmd_vel_stamp;

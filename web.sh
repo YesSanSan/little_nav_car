@@ -7,6 +7,8 @@ WORKSPACE_DIR="${SCRIPT_DIR}"
 STACK_MODE_ARG="--detach"
 WEB_HOST="${LC_WEB_HOST:-0.0.0.0}"
 WEB_PORT="${LC_WEB_PORT:-8080}"
+VISION_SETTINGS_FILE="${WORKSPACE_DIR}/build/lc_web_control/web_vision_settings.json"
+VISION_YAML_FILE="${WORKSPACE_DIR}/src/lc_vision/config/vision.yaml"
 
 export STACK_SESSION_NAME="web"
 export STACK_WORKSPACE_DIR="${WORKSPACE_DIR}"
@@ -54,8 +56,12 @@ if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
   exit 1
 fi
 
+python3 "${WORKSPACE_DIR}/scripts/sync_web_vision_settings.py" \
+  --vision-yaml "${VISION_YAML_FILE}" \
+  --settings-file "${VISION_SETTINGS_FILE}"
+
 export STACK_TASK_NAMES="web_control"
-export STACK_TASK_CMDS="ros2 launch lc_web_control lc_web_control.launch.py workspace_dir:=${WORKSPACE_DIR} bind_host:=${WEB_HOST} port:=${WEB_PORT}"
+export STACK_TASK_CMDS="ros2 launch lc_web_control lc_web_control.launch.py workspace_dir:=${WORKSPACE_DIR} bind_host:=${WEB_HOST} port:=${WEB_PORT} settings_file:=${VISION_SETTINGS_FILE}"
 export STACK_TASK_START_DELAYS="0"
 export STACK_IMU_TOPIC="/base/imu0"
 export STACK_IMU_STABLE_DURATION_SEC="2.0"
