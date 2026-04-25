@@ -57,9 +57,9 @@ if [[ "${USE_LC_VISION}" != "true" ]]; then
   NAVIGATION_CMD="ros2 launch lc_navigation bringup_launch.py use_lc_vision:=False use_rviz:=False"
 fi
 
-export STACK_TASK_NAMES="lidar|yesense|serial|localization|navigation"
-export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch rm_serial_driver serial_driver.launch.py|ros2 launch lc_localization ekf.launch.py|${NAVIGATION_CMD}"
-export STACK_TASK_START_DELAYS="0|0|0|0|2"
+export STACK_TASK_NAMES="lidar|yesense|localization|navigation"
+export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch lc_localization ekf.launch.py|${NAVIGATION_CMD}"
+export STACK_TASK_START_DELAYS="0|0|0|2"
 
 export STACK_IMU_TOPIC="/base/imu0"
 export STACK_IMU_STABLE_DURATION_SEC="2.0"

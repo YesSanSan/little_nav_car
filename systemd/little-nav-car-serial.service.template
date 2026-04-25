@@ -1,0 +1,15 @@
+[Unit]
+Description=Little Nav Car serial driver autostart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@RUN_USER@
+WorkingDirectory=@WORKSPACE_DIR@
+ExecStart=/bin/bash @WORKSPACE_DIR@/auto_serial.sh --detach
+ExecStop=/bin/bash @WORKSPACE_DIR@/auto_serial.sh --stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
