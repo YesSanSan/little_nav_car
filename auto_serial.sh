@@ -1,19 +1,47 @@
 #!/bin/bash
-cmds=(
-        #"ros2 launch livox_ros_driver2 msg_MID360_launch.py"
-        #"ros2 launch fast_lio mapping_mid360.launch.py"
-        #"ros2 launch sentry localization.launch.py"
-        #"ros2 launch linefit_ground_segmentation_ros segmentation.launch.py"
-        #"ros2 launch pointcloud_to_laserscan pointcloud_to_laserscan_launch.py"
-        "ros2 launch rm_serial_driver serial_driver.launch.py "
-        #"ros2 launch rm_navigation bringup_launch.py"
-        #"ros2 launch rm_decision rm_decision.launch.py"
-        #"ros2 launch rm_navigation rviz_launch.py"
-)
 
-for cmd in "${cmds[@]}";
-do
-        #gnome-terminal -- bash -c "cd /home/navigation/evolution-sentry;source install/setup.bash;$cmd;exec bash;"
-        bash -c "cd /home/navigation/evolution-sentry;source install/setup.bash;$cmd;exec bash;"
-        sleep 0.2
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="${SCRIPT_DIR}"
+STACK_MODE_ARG="--detach"
+
+export STACK_SESSION_NAME="serial"
+export STACK_WORKSPACE_DIR="${WORKSPACE_DIR}"
+export STACK_MODE_LABEL="ROS2 serial driver"
+export STACK_ENTRY_SCRIPT_NAME="auto_serial.sh"
+
+usage() {
+  cat <<EOF
+Usage: ./auto_serial.sh [--attach|--detach|--stop|--status|--help]
+EOF
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --attach|--detach|--stop|--status)
+      STACK_MODE_ARG="$1"
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
 done
+
+if [[ ! -f "${WORKSPACE_DIR}/install/setup.bash" ]]; then
+  echo "Missing ${WORKSPACE_DIR}/install/setup.bash. Please build the workspace first with colcon build." >&2
+  exit 1
+fi
+
+export STACK_TASK_NAMES="serial"
+export STACK_TASK_CMDS="ros2 launch rm_serial_driver serial_driver.launch.py"
+export STACK_TASK_START_DELAYS="0"
+
+exec "${WORKSPACE_DIR}/scripts/start_stack.sh" "${STACK_MODE_ARG}"

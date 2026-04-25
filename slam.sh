@@ -53,13 +53,13 @@ export OPENVINO_ROOT="${OPENVINO_ROOT:-${DEFAULT_OPENVINO_ROOT}}"
 export ASTRA_SDK_ROOT="${ASTRA_SDK_ROOT:-${DEFAULT_ASTRA_SDK_ROOT}}"
 
 if [[ "${USE_LC_VISION}" == "true" ]]; then
-  export STACK_TASK_NAMES="lidar|yesense|serial|lc_vision|localization|navigation"
-  export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch rm_serial_driver serial_driver.launch.py|ros2 launch lc_vision lc_vision.launch.py|ros2 launch lc_localization ekf.launch.py|ros2 launch lc_navigation slam.py slam:=True"
-  export STACK_TASK_START_DELAYS="0|0|0|0|0|2"
-else
-  export STACK_TASK_NAMES="lidar|yesense|serial|localization|navigation"
-  export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch rm_serial_driver serial_driver.launch.py|ros2 launch lc_localization ekf.launch.py|ros2 launch lc_navigation slam.py slam:=True"
+  export STACK_TASK_NAMES="lidar|yesense|lc_vision|localization|navigation"
+  export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch lc_vision lc_vision.launch.py|ros2 launch lc_localization ekf.launch.py|ros2 launch lc_navigation slam.py slam:=True"
   export STACK_TASK_START_DELAYS="0|0|0|0|2"
+else
+  export STACK_TASK_NAMES="lidar|yesense|localization|navigation"
+  export STACK_TASK_CMDS="ros2 launch lslidar_driver lslidar_launch.py|ros2 launch yesense_std_ros2 yesense_node.launch.py|ros2 launch lc_localization ekf.launch.py|ros2 launch lc_navigation slam.py slam:=True"
+  export STACK_TASK_START_DELAYS="0|0|0|2"
 fi
 
 export STACK_IMU_TOPIC="/base/imu0"

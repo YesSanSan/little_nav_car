@@ -1,0 +1,15 @@
+[Unit]
+Description=Little Nav Car web control autostart
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@RUN_USER@
+WorkingDirectory=@WORKSPACE_DIR@
+ExecStart=/bin/bash @WORKSPACE_DIR@/web.sh --detach
+ExecStop=/bin/bash @WORKSPACE_DIR@/web.sh --stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
