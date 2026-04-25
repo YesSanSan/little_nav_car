@@ -167,6 +167,55 @@ button.warn {
   line-height: 1.6;
 }
 
+.tuning-panel {
+  margin-bottom: 18px;
+}
+
+.tuning-header {
+  align-items: flex-start;
+}
+
+.tuning-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.setting-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(90, 63, 38, 0.05);
+  border: 1px solid rgba(90, 63, 38, 0.08);
+}
+
+.setting-card input[type="number"] {
+  width: 100%;
+  border: 1px solid rgba(90, 63, 38, 0.14);
+  border-radius: 14px;
+  padding: 11px 12px;
+  font: inherit;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.setting-card input[type="number"]:focus {
+  outline: 2px solid rgba(15, 118, 110, 0.2);
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+.setting-toggle {
+  justify-content: space-between;
+}
+
+.setting-toggle input[type="checkbox"] {
+  width: 22px;
+  height: 22px;
+  accent-color: var(--primary);
+}
+
 .toggle-row {
   display: inline-flex;
   align-items: center;
@@ -313,6 +362,10 @@ button.warn {
 
   .hero {
     flex-direction: column;
+  }
+
+  .tuning-grid {
+    grid-template-columns: 1fr;
   }
 
 }

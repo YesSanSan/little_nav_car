@@ -109,6 +109,30 @@
         </div>
       </section>
 
+      <section class="panel tuning-panel">
+        <header class="panel-header tuning-header">
+          <div>
+            <h2>追踪参数</h2>
+          </div>
+          <span id="visionTuningStatusPill" class="status-pill neutral">读取中</span>
+        </header>
+        <div class="tuning-grid">
+          <label class="setting-card setting-toggle" for="nav2TrackingToggle">
+            <span class="label">启用 nav2 追踪</span>
+            <input id="nav2TrackingToggle" type="checkbox" />
+          </label>
+          <label class="setting-card" for="stopDistanceInput">
+            <span class="label">追踪停止距离 (m)</span>
+            <input id="stopDistanceInput" type="number" min="0" step="0.01" inputmode="decimal" />
+          </label>
+          <label class="setting-card" for="lidarProtectionInput">
+            <span class="label">雷达防撞距离 (m)</span>
+            <input id="lidarProtectionInput" type="number" min="0" step="0.01" inputmode="decimal" />
+          </label>
+        </div>
+        <p id="visionTuningHint" class="hint">修改后会自动保存到 build 临时配置，并同步到 lc_vision。</p>
+      </section>
+
       <section class="panel">
         <header class="panel-header">
           <h2>操作消息</h2>

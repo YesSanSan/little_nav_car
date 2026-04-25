@@ -16,6 +16,9 @@ LCVision::LCVision(const rclcpp::NodeOptions &options)
         nav_to_pose_ = rclcpp_action::create_client<NavigateToPose>(this, "navigate_to_pose");
         impl_->tracking_runtime_enabled.store(impl_->tracking.enable);
         impl_->goal_runtime_enabled.store(impl_->goal.enable);
+        impl_->nav_goal_runtime_enabled.store(impl_->tracking.nav_goal.enable);
+        impl_->goal_standoff_distance_runtime_m.store(impl_->goal.standoff_distance_m);
+        impl_->lidar_min_forward_protection_runtime_m.store(impl_->tracking.lidar.min_forward_protection_m);
         impl_->parameter_callback_handle =
             this->add_on_set_parameters_callback([this](const std::vector<rclcpp::Parameter> &parameters) {
                 return handleRuntimeParameters(parameters);
@@ -368,6 +371,7 @@ void LCVision::getParams() {
         this->declare_parameter<std::string>("tracking.nav_fallback.cmd_vel_topic", "/cmd_vel_nav");
     impl_->tracking.nav_fallback.no_cmd_vel_timeout_sec = static_cast<float>(
         this->declare_parameter<double>("tracking.nav_fallback.no_cmd_vel_timeout_sec", 1.5));
+    impl_->tracking.nav_goal.enable = this->declare_parameter<bool>("tracking.nav_goal.enable", true);
     impl_->tracking.debug.enable_verbose_logs =
         this->declare_parameter<bool>("tracking.debug.enable_verbose_logs", false);
     impl_->tracking.debug.max_track_memories =
@@ -660,6 +664,9 @@ LCVision::handleRuntimeParameters(const std::vector<rclcpp::Parameter> &paramete
 
     bool tracking_updated = false;
     bool goal_updated = false;
+    bool nav_goal_updated = false;
+    bool standoff_updated = false;
+    bool lidar_updated = false;
 
     for (const auto &parameter : parameters) {
         if (parameter.get_name() == "tracking.enable") {
@@ -681,19 +688,73 @@ LCVision::handleRuntimeParameters(const std::vector<rclcpp::Parameter> &paramete
             }
             impl_->goal_runtime_enabled.store(parameter.as_bool());
             goal_updated = true;
+            continue;
+        }
+
+        if (parameter.get_name() == "tracking.nav_goal.enable") {
+            if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_BOOL) {
+                result.successful = false;
+                result.reason = "tracking.nav_goal.enable must be a boolean";
+                return result;
+            }
+            impl_->nav_goal_runtime_enabled.store(parameter.as_bool());
+            nav_goal_updated = true;
+            continue;
+        }
+
+        if (parameter.get_name() == "goal.standoff_distance_m") {
+            if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+                result.successful = false;
+                result.reason = "goal.standoff_distance_m must be a double";
+                return result;
+            }
+            const double value = parameter.as_double();
+            if (value < 0.0) {
+                result.successful = false;
+                result.reason = "goal.standoff_distance_m must be non-negative";
+                return result;
+            }
+            impl_->goal_standoff_distance_runtime_m.store(value);
+            standoff_updated = true;
+            continue;
+        }
+
+        if (parameter.get_name() == "tracking.lidar.min_forward_protection_m") {
+            if (parameter.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE) {
+                result.successful = false;
+                result.reason = "tracking.lidar.min_forward_protection_m must be a double";
+                return result;
+            }
+            const double value = parameter.as_double();
+            if (value < 0.0) {
+                result.successful = false;
+                result.reason = "tracking.lidar.min_forward_protection_m must be non-negative";
+                return result;
+            }
+            impl_->lidar_min_forward_protection_runtime_m.store(value);
+            lidar_updated = true;
         }
     }
 
-    if (tracking_updated || goal_updated) {
+    if (tracking_updated || goal_updated || nav_goal_updated || standoff_updated || lidar_updated) {
         const bool tracking_enabled = impl_->tracking_runtime_enabled.load(std::memory_order_relaxed);
         const bool goal_enabled = impl_->goal_runtime_enabled.load(std::memory_order_relaxed);
+        const bool nav_goal_enabled = impl_->nav_goal_runtime_enabled.load(std::memory_order_relaxed);
+        const double standoff_distance_m = impl_->goal_standoff_distance_runtime_m.load(std::memory_order_relaxed);
+        const double lidar_distance_m =
+            impl_->lidar_min_forward_protection_runtime_m.load(std::memory_order_relaxed);
         RCLCPP_INFO(
-            get_logger(), "Runtime vision control updated: tracking.enable=%s goal.enable=%s",
-            tracking_enabled ? "true" : "false", goal_enabled ? "true" : "false");
+            get_logger(),
+            "Runtime vision control updated: tracking.enable=%s goal.enable=%s tracking.nav_goal.enable=%s "
+            "goal.standoff_distance_m=%.3f tracking.lidar.min_forward_protection_m=%.3f",
+            tracking_enabled ? "true" : "false", goal_enabled ? "true" : "false",
+            nav_goal_enabled ? "true" : "false", standoff_distance_m, lidar_distance_m);
 
         if (!tracking_enabled || !goal_enabled) {
             cancelCurrentNavigationGoal("vision tracking disabled");
             impl_->stopTrackingMotion("vision tracking disabled", true);
+        } else if (!nav_goal_enabled) {
+            cancelCurrentNavigationGoal("nav2 tracking disabled");
         }
     }
 

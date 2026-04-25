@@ -2,6 +2,8 @@ const state = {
   mapPayload: null,
   mapBaseCanvas: null,
   logLines: [],
+  visionTuningSaveTimer: null,
+  visionTuningDirty: false,
   view: {
     scale: 1,
     minScale: 1,
@@ -52,16 +54,26 @@ const els = {
   returnHomeButton: document.getElementById("returnHomeButton"),
   markCurrentButton: document.getElementById("markCurrentButton"),
   markStartupButton: document.getElementById("markStartupButton"),
+  visionTuningStatusPill: document.getElementById("visionTuningStatusPill"),
+  visionTuningHint: document.getElementById("visionTuningHint"),
+  nav2TrackingToggle: document.getElementById("nav2TrackingToggle"),
+  stopDistanceInput: document.getElementById("stopDistanceInput"),
+  lidarProtectionInput: document.getElementById("lidarProtectionInput"),
 };
 
 function logMessage(message) {
   const timestamp = new Date().toLocaleTimeString("zh-CN", { hour12: false });
   state.logLines.unshift(`[${timestamp}] ${message}`);
   state.logLines = state.logLines.slice(0, 40);
-  els.messageLog.textContent = state.logLines.join("\n");
+  if (els.messageLog) {
+    els.messageLog.textContent = state.logLines.join("\n");
+  }
 }
 
 function setPill(element, text, tone = "neutral") {
+  if (!element) {
+    return;
+  }
   element.textContent = text;
   element.classList.remove("good", "warn", "neutral");
   element.classList.add(tone);
@@ -72,6 +84,23 @@ function formatPose(pose) {
     return "未知";
   }
   return `x=${pose.x.toFixed(2)} m, y=${pose.y.toFixed(2)} m, yaw=${((pose.yaw * 180) / Math.PI).toFixed(1)}°`;
+}
+
+function syncNumberInputValue(element, value) {
+  if (document.activeElement === element) {
+    return;
+  }
+  const normalizedValue = Number(value).toFixed(2);
+  if (element.value !== normalizedValue) {
+    element.value = normalizedValue;
+  }
+}
+
+function syncCheckboxValue(element, value) {
+  if (document.activeElement === element) {
+    return;
+  }
+  element.checked = Boolean(value);
 }
 
 async function fetchJson(url, options = {}) {
@@ -455,6 +484,33 @@ function updateStatusUi(payload) {
     els.visionHint.textContent = payload.vision.last_error || "等待 lc_vision 参数服务。";
   }
 
+  const tuning = payload.vision.tuning;
+  if (tuning) {
+    if (!state.visionTuningDirty) {
+      syncCheckboxValue(els.nav2TrackingToggle, tuning.desired_nav2_tracking_enabled);
+      syncNumberInputValue(els.stopDistanceInput, tuning.desired_stop_distance_m);
+      syncNumberInputValue(
+        els.lidarProtectionInput,
+        tuning.desired_lidar_protection_distance_m
+      );
+    }
+
+    if (!tuning.available && tuning.pending_apply) {
+      setPill(els.visionTuningStatusPill, "等待 lc_vision", "warn");
+      els.visionTuningHint.textContent =
+        tuning.last_error || "lc_vision 未连接，参数已保存，稍后会自动同步。";
+    } else if (tuning.available && tuning.pending_apply) {
+      setPill(els.visionTuningStatusPill, "同步失败", "warn");
+      els.visionTuningHint.textContent = tuning.last_error || "网页调参同步失败，正在等待重试。";
+    } else if (tuning.available) {
+      setPill(els.visionTuningStatusPill, "已同步", "good");
+      els.visionTuningHint.textContent = tuning.last_error || "修改后会自动保存到 build 临时配置，并同步到 lc_vision。";
+    } else {
+      setPill(els.visionTuningStatusPill, "未连接", "neutral");
+      els.visionTuningHint.textContent = tuning.last_error || "等待 lc_vision 参数服务。";
+    }
+  }
+
   if (payload.return_pose) {
     setPill(els.returnStatusPill, "返航点已设置", "good");
     els.returnPoseText.textContent = formatPose(payload.return_pose);
@@ -516,6 +572,55 @@ async function runAction(button, label, action) {
   } finally {
     button.disabled = false;
   }
+}
+
+function collectVisionTuningForm() {
+  const stopDistance = Number.parseFloat(els.stopDistanceInput.value);
+  const lidarDistance = Number.parseFloat(els.lidarProtectionInput.value);
+
+  if (!Number.isFinite(stopDistance) || stopDistance < 0) {
+    throw new Error("追踪停止距离必须是大于等于 0 的数字");
+  }
+  if (!Number.isFinite(lidarDistance) || lidarDistance < 0) {
+    throw new Error("雷达防撞距离必须是大于等于 0 的数字");
+  }
+
+  return {
+    nav2_tracking_enabled: els.nav2TrackingToggle.checked,
+    stop_distance_m: stopDistance,
+    lidar_protection_distance_m: lidarDistance,
+  };
+}
+
+async function saveVisionTuning() {
+  if (state.visionTuningSaveTimer) {
+    window.clearTimeout(state.visionTuningSaveTimer);
+    state.visionTuningSaveTimer = null;
+  }
+
+  try {
+    const payload = collectVisionTuningForm();
+    state.visionTuningDirty = false;
+    const response = await postJson("/api/vision_settings", payload);
+    logMessage(`追踪参数已保存: ${response.message || "已更新"}`);
+    await refreshStatus();
+  } catch (error) {
+    state.visionTuningDirty = false;
+    logMessage(`保存追踪参数失败: ${error.message}`);
+    await refreshStatus();
+  }
+}
+
+function scheduleVisionTuningSave() {
+  state.visionTuningDirty = true;
+  setPill(els.visionTuningStatusPill, "保存中", "warn");
+  els.visionTuningHint.textContent = "参数修改已记录，正在自动保存...";
+  if (state.visionTuningSaveTimer) {
+    window.clearTimeout(state.visionTuningSaveTimer);
+  }
+  state.visionTuningSaveTimer = window.setTimeout(() => {
+    saveVisionTuning();
+  }, 450);
 }
 
 function getRelativePointerPosition(event) {
@@ -604,6 +709,12 @@ function installButtonHandlers() {
   els.markStartupButton.addEventListener("click", () =>
     runAction(els.markStartupButton, "标记启动位置为返航点", () => postJson("/api/return_point/startup"))
   );
+
+  els.nav2TrackingToggle.addEventListener("change", scheduleVisionTuningSave);
+  els.stopDistanceInput.addEventListener("input", scheduleVisionTuningSave);
+  els.stopDistanceInput.addEventListener("change", scheduleVisionTuningSave);
+  els.lidarProtectionInput.addEventListener("input", scheduleVisionTuningSave);
+  els.lidarProtectionInput.addEventListener("change", scheduleVisionTuningSave);
 }
 
 function installMapHandlers() {

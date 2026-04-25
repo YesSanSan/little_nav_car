@@ -21,6 +21,13 @@ from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
+def clamp_non_negative(value: Any, field_name: str) -> float:
+    numeric_value = float(value)
+    if numeric_value < 0.0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return numeric_value
+
+
 def yaw_from_quaternion(quaternion: Any) -> float:
     siny_cosp = 2.0 * (quaternion.w * quaternion.z + quaternion.x * quaternion.y)
     cosy_cosp = 1.0 - 2.0 * (quaternion.y * quaternion.y + quaternion.z * quaternion.z)
@@ -118,6 +125,16 @@ def make_request_handler():
                 if route == "/api/return_point/startup":
                     self._send_json(HTTPStatus.OK, self.app.set_return_pose_to_startup())
                     return
+                if route == "/api/vision_settings":
+                    self._send_json(
+                        HTTPStatus.OK,
+                        self.app.set_vision_tuning(
+                            bool(payload["nav2_tracking_enabled"]),
+                            payload["stop_distance_m"],
+                            payload["lidar_protection_distance_m"],
+                        ),
+                    )
+                    return
 
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "message": f"Unknown route: {route}"})
             except KeyError as exc:
@@ -197,6 +214,10 @@ class WebControlNode(Node):
         self.state_file = Path(
             self.declare_parameter("state_file", str(default_state_file)).value
         ).expanduser()
+        default_settings_file = self.workspace_dir / "build" / "lc_web_control" / "web_vision_settings.json"
+        self.settings_file = Path(
+            self.declare_parameter("settings_file", str(default_settings_file)).value
+        ).expanduser()
 
         self.static_dir = Path(get_package_share_directory("lc_web_control")) / "static"
         self.state_lock = threading.Lock()
@@ -214,6 +235,7 @@ class WebControlNode(Node):
             "pending_apply": False,
             "last_error": "lc_vision parameter service unavailable",
         }
+        self._vision_tuning: Dict[str, Any] = self._default_tuning_payload()
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
@@ -228,6 +250,7 @@ class WebControlNode(Node):
         self.create_timer(1.0, self._refresh_vision_status)
 
         self._load_return_pose()
+        self._load_vision_tuning()
         self._start_http_server()
 
         self.get_logger().info(
@@ -284,10 +307,31 @@ class WebControlNode(Node):
                     "pending_apply": self._vision_status["pending_apply"],
                     "last_error": "lc_vision parameter service unavailable",
                 }
+                self._vision_tuning = {
+                    "available": False,
+                    "desired_nav2_tracking_enabled": self._vision_tuning["desired_nav2_tracking_enabled"],
+                    "desired_stop_distance_m": self._vision_tuning["desired_stop_distance_m"],
+                    "desired_lidar_protection_distance_m": self._vision_tuning["desired_lidar_protection_distance_m"],
+                    "last_applied_nav2_tracking_enabled": self._vision_tuning["last_applied_nav2_tracking_enabled"],
+                    "last_applied_stop_distance_m": self._vision_tuning["last_applied_stop_distance_m"],
+                    "last_applied_lidar_protection_distance_m": self._vision_tuning[
+                        "last_applied_lidar_protection_distance_m"
+                    ],
+                    "pending_apply": self._vision_tuning["pending_apply"],
+                    "last_error": "lc_vision parameter service unavailable",
+                }
             return
 
         self._vision_status_request_pending = True
-        future = self.vision_parameter_client.get_parameters(["tracking.enable", "goal.enable"])
+        future = self.vision_parameter_client.get_parameters(
+            [
+                "tracking.enable",
+                "goal.enable",
+                "tracking.nav_goal.enable",
+                "goal.standoff_distance_m",
+                "tracking.lidar.min_forward_protection_m",
+            ]
+        )
         future.add_done_callback(self._handle_vision_status_response)
 
     def _handle_vision_status_response(self, future) -> None:
@@ -296,8 +340,18 @@ class WebControlNode(Node):
             values = getattr(response, "values", [])
             tracking_enabled = bool(parameter_value_to_python(values[0])) if len(values) > 0 else False
             goal_enabled = bool(parameter_value_to_python(values[1])) if len(values) > 1 else False
+            nav2_tracking_enabled = bool(parameter_value_to_python(values[2])) if len(values) > 2 else False
+            stop_distance_m = float(parameter_value_to_python(values[3])) if len(values) > 3 else 0.0
+            lidar_protection_distance_m = float(parameter_value_to_python(values[4])) if len(values) > 4 else 0.0
             effective_enabled = tracking_enabled and goal_enabled
             status = self._update_vision_status_after_read(effective_enabled)
+            tuning = self._update_vision_tuning_after_read(
+                {
+                    "nav2_tracking_enabled": nav2_tracking_enabled,
+                    "stop_distance_m": stop_distance_m,
+                    "lidar_protection_distance_m": lidar_protection_distance_m,
+                }
+            )
         except Exception as exc:
             with self.state_lock:
                 status = {
@@ -308,12 +362,39 @@ class WebControlNode(Node):
                     "pending_apply": self._vision_status["pending_apply"],
                     "last_error": str(exc),
                 }
+                tuning = {
+                    "available": False,
+                    "desired_nav2_tracking_enabled": self._vision_tuning["desired_nav2_tracking_enabled"],
+                    "desired_stop_distance_m": self._vision_tuning["desired_stop_distance_m"],
+                    "desired_lidar_protection_distance_m": self._vision_tuning["desired_lidar_protection_distance_m"],
+                    "last_applied_nav2_tracking_enabled": self._vision_tuning["last_applied_nav2_tracking_enabled"],
+                    "last_applied_stop_distance_m": self._vision_tuning["last_applied_stop_distance_m"],
+                    "last_applied_lidar_protection_distance_m": self._vision_tuning[
+                        "last_applied_lidar_protection_distance_m"
+                    ],
+                    "pending_apply": self._vision_tuning["pending_apply"],
+                    "last_error": str(exc),
+                }
         finally:
             self._vision_status_request_pending = False
 
         with self.state_lock:
             self._vision_status = status
+            self._vision_tuning = tuning
         self._save_return_pose()
+
+    def _default_tuning_payload(self) -> Dict[str, Any]:
+        return {
+            "available": False,
+            "desired_nav2_tracking_enabled": False,
+            "desired_stop_distance_m": 0.65,
+            "desired_lidar_protection_distance_m": 0.50,
+            "last_applied_nav2_tracking_enabled": False,
+            "last_applied_stop_distance_m": 0.65,
+            "last_applied_lidar_protection_distance_m": 0.50,
+            "pending_apply": False,
+            "last_error": "lc_vision parameter service unavailable",
+        }
 
     def _default_state_payload(self) -> Dict[str, Any]:
         return {
@@ -426,6 +507,72 @@ class WebControlNode(Node):
             "last_error": None,
         }
 
+    def _build_desired_tuning(self) -> Dict[str, Any]:
+        with self.state_lock:
+            return {
+                "nav2_tracking_enabled": bool(self._vision_tuning["desired_nav2_tracking_enabled"]),
+                "stop_distance_m": float(self._vision_tuning["desired_stop_distance_m"]),
+                "lidar_protection_distance_m": float(self._vision_tuning["desired_lidar_protection_distance_m"]),
+            }
+
+    def _settings_match(self, desired: Dict[str, Any], actual: Dict[str, Any]) -> bool:
+        return (
+            bool(desired["nav2_tracking_enabled"]) == bool(actual["nav2_tracking_enabled"])
+            and math.isclose(float(desired["stop_distance_m"]), float(actual["stop_distance_m"]), abs_tol=1.0e-4)
+            and math.isclose(
+                float(desired["lidar_protection_distance_m"]),
+                float(actual["lidar_protection_distance_m"]),
+                abs_tol=1.0e-4,
+            )
+        )
+
+    def _update_vision_tuning_after_read(self, actual: Dict[str, Any]) -> Dict[str, Any]:
+        desired = self._build_desired_tuning()
+
+        if not self._settings_match(desired, actual):
+            try:
+                self._apply_vision_tuning(desired)
+                return {
+                    "available": True,
+                    "desired_nav2_tracking_enabled": desired["nav2_tracking_enabled"],
+                    "desired_stop_distance_m": desired["stop_distance_m"],
+                    "desired_lidar_protection_distance_m": desired["lidar_protection_distance_m"],
+                    "last_applied_nav2_tracking_enabled": desired["nav2_tracking_enabled"],
+                    "last_applied_stop_distance_m": desired["stop_distance_m"],
+                    "last_applied_lidar_protection_distance_m": desired["lidar_protection_distance_m"],
+                    "pending_apply": False,
+                    "last_error": "网页追踪参数已自动同步到 lc_vision",
+                }
+            except RuntimeError as exc:
+                with self.state_lock:
+                    return {
+                        "available": True,
+                        "desired_nav2_tracking_enabled": desired["nav2_tracking_enabled"],
+                        "desired_stop_distance_m": desired["stop_distance_m"],
+                        "desired_lidar_protection_distance_m": desired["lidar_protection_distance_m"],
+                        "last_applied_nav2_tracking_enabled": self._vision_tuning[
+                            "last_applied_nav2_tracking_enabled"
+                        ],
+                        "last_applied_stop_distance_m": self._vision_tuning["last_applied_stop_distance_m"],
+                        "last_applied_lidar_protection_distance_m": self._vision_tuning[
+                            "last_applied_lidar_protection_distance_m"
+                        ],
+                        "pending_apply": True,
+                        "last_error": str(exc),
+                    }
+
+        return {
+            "available": True,
+            "desired_nav2_tracking_enabled": desired["nav2_tracking_enabled"],
+            "desired_stop_distance_m": desired["stop_distance_m"],
+            "desired_lidar_protection_distance_m": desired["lidar_protection_distance_m"],
+            "last_applied_nav2_tracking_enabled": bool(actual["nav2_tracking_enabled"]),
+            "last_applied_stop_distance_m": float(actual["stop_distance_m"]),
+            "last_applied_lidar_protection_distance_m": float(actual["lidar_protection_distance_m"]),
+            "pending_apply": False,
+            "last_error": None,
+        }
+
     def _load_return_pose(self) -> None:
         if not self.state_file.is_file():
             return
@@ -446,11 +593,49 @@ class WebControlNode(Node):
         except Exception as exc:
             self.get_logger().warn(f"Failed to load saved state from {self.state_file}: {exc}")
 
+    def _load_vision_tuning(self) -> None:
+        if not self.settings_file.is_file():
+            return
+
+        try:
+            payload = json.loads(self.settings_file.read_text(encoding="utf-8"))
+            tuning = {
+                "nav2_tracking_enabled": bool(payload.get("nav2_tracking_enabled", False)),
+                "stop_distance_m": clamp_non_negative(payload.get("stop_distance_m", 0.65), "stop_distance_m"),
+                "lidar_protection_distance_m": clamp_non_negative(
+                    payload.get("lidar_protection_distance_m", 0.50),
+                    "lidar_protection_distance_m",
+                ),
+            }
+            with self.state_lock:
+                self._vision_tuning.update(
+                    {
+                        "desired_nav2_tracking_enabled": tuning["nav2_tracking_enabled"],
+                        "desired_stop_distance_m": tuning["stop_distance_m"],
+                        "desired_lidar_protection_distance_m": tuning["lidar_protection_distance_m"],
+                        "last_applied_nav2_tracking_enabled": tuning["nav2_tracking_enabled"],
+                        "last_applied_stop_distance_m": tuning["stop_distance_m"],
+                        "last_applied_lidar_protection_distance_m": tuning["lidar_protection_distance_m"],
+                        "pending_apply": True,
+                        "last_error": "等待 lc_vision 参数服务可用后自动同步",
+                    }
+                )
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to load saved vision tuning from {self.settings_file}: {exc}")
+
     def _save_return_pose(self) -> None:
         payload = self._current_state_payload()
 
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         self.state_file.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    def _save_vision_tuning(self) -> None:
+        payload = self._build_desired_tuning()
+        self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+        self.settings_file.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
@@ -465,6 +650,27 @@ class WebControlNode(Node):
             future,
             5.0,
             "Timed out while waiting for lc_vision parameter update",
+        )
+        results = getattr(response, "results", response)
+        failures = [item.reason for item in results if not item.successful]
+        if failures:
+            raise RuntimeError("; ".join(failures))
+
+    def _apply_vision_tuning(self, tuning: Dict[str, Any]) -> None:
+        parameters = [
+            Parameter("tracking.nav_goal.enable", Parameter.Type.BOOL, bool(tuning["nav2_tracking_enabled"])),
+            Parameter("goal.standoff_distance_m", Parameter.Type.DOUBLE, float(tuning["stop_distance_m"])),
+            Parameter(
+                "tracking.lidar.min_forward_protection_m",
+                Parameter.Type.DOUBLE,
+                float(tuning["lidar_protection_distance_m"]),
+            ),
+        ]
+        future = self.vision_parameter_client.set_parameters(parameters)
+        response = self._wait_for_future(
+            future,
+            5.0,
+            "Timed out while waiting for lc_vision tuning parameter update",
         )
         results = getattr(response, "results", response)
         failures = [item.reason for item in results if not item.successful]
@@ -507,6 +713,65 @@ class WebControlNode(Node):
             "tracking_enabled": enabled,
             "pending_apply": False,
             "message": "视觉追踪已开启" if enabled else "视觉追踪已停止",
+        }
+
+    def set_vision_tuning(
+        self,
+        nav2_tracking_enabled: bool,
+        stop_distance_m: Any,
+        lidar_protection_distance_m: Any,
+    ) -> Dict[str, Any]:
+        tuning = {
+            "nav2_tracking_enabled": bool(nav2_tracking_enabled),
+            "stop_distance_m": clamp_non_negative(stop_distance_m, "stop_distance_m"),
+            "lidar_protection_distance_m": clamp_non_negative(
+                lidar_protection_distance_m,
+                "lidar_protection_distance_m",
+            ),
+        }
+
+        if not self.vision_parameter_client.wait_for_services(timeout_sec=1.0):
+            with self.state_lock:
+                self._vision_tuning = {
+                    "available": False,
+                    "desired_nav2_tracking_enabled": tuning["nav2_tracking_enabled"],
+                    "desired_stop_distance_m": tuning["stop_distance_m"],
+                    "desired_lidar_protection_distance_m": tuning["lidar_protection_distance_m"],
+                    "last_applied_nav2_tracking_enabled": self._vision_tuning["last_applied_nav2_tracking_enabled"],
+                    "last_applied_stop_distance_m": self._vision_tuning["last_applied_stop_distance_m"],
+                    "last_applied_lidar_protection_distance_m": self._vision_tuning[
+                        "last_applied_lidar_protection_distance_m"
+                    ],
+                    "pending_apply": True,
+                    "last_error": "lc_vision 尚未启动，已记录网页调参，待参数服务可用后自动应用",
+                }
+            self._save_vision_tuning()
+            return {
+                "ok": True,
+                "pending_apply": True,
+                "tuning": tuning,
+                "message": "lc_vision 尚未启动，已记录追踪参数，稍后会自动应用",
+            }
+
+        self._apply_vision_tuning(tuning)
+        with self.state_lock:
+            self._vision_tuning = {
+                "available": True,
+                "desired_nav2_tracking_enabled": tuning["nav2_tracking_enabled"],
+                "desired_stop_distance_m": tuning["stop_distance_m"],
+                "desired_lidar_protection_distance_m": tuning["lidar_protection_distance_m"],
+                "last_applied_nav2_tracking_enabled": tuning["nav2_tracking_enabled"],
+                "last_applied_stop_distance_m": tuning["stop_distance_m"],
+                "last_applied_lidar_protection_distance_m": tuning["lidar_protection_distance_m"],
+                "pending_apply": False,
+                "last_error": None,
+            }
+        self._save_vision_tuning()
+        return {
+            "ok": True,
+            "pending_apply": False,
+            "tuning": tuning,
+            "message": "网页追踪参数已更新",
         }
 
     def _run_workspace_script(self, script_name: str, *args: str) -> Dict[str, Any]:
@@ -647,6 +912,7 @@ class WebControlNode(Node):
             target_point = self._point_to_dict(self._latest_target_point) if self._latest_target_point else None
             goal_pose = self._pose_to_dict(self._latest_goal_pose) if self._latest_goal_pose else None
             vision_status = dict(self._vision_status)
+            vision_tuning = dict(self._vision_tuning)
 
         map_frame = self.global_frame
         if latest_map is not None and latest_map.header.frame_id:
@@ -669,6 +935,7 @@ class WebControlNode(Node):
             "return_pose": return_pose,
             "vision": {
                 **vision_status,
+                "tuning": vision_tuning,
                 "target_point": target_point,
                 "goal_pose": goal_pose,
             },
